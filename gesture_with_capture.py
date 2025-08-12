@@ -11,7 +11,7 @@ try:
 except Exception:
     OpenAI = None
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # or your "gpt-5"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # or "gpt-5"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 work_q = queue.Queue(maxsize=4)
@@ -30,7 +30,7 @@ def api_worker():
             msgs = [
                 {"role":"system","content":"You are an expert product identifier. Be concise and name the item if possible."},
                 {"role":"user","content":[
-                    {"type":"text","text":f"Identify the object. (trigger={tag})"},
+                    {"type":"text","text":f"Identify the object. (mode={tag})"},
                     {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
                 ]},
             ]
@@ -74,10 +74,18 @@ POOL_FRAMES = 2
 HEADLESS = os.environ.get("DISPLAY", "") == ""
 
 # =========================
+# Stability / presence gating after a mode is set
+# =========================
+WAIT_AFTER_SWIPE_S    = 1.00     # don't snap immediately; give time to present item
+STABILITY_WINDOW_FR   = 8        # need this many consecutive stable frames
+MOTION_THR_FRAC       = 0.003    # normalized motion energy threshold for "stable"
+PRESENCE_LAPLACE_MIN  = 25.0     # detail threshold (Laplacian var) to ensure object exists
+ARM_TIMEOUT_S         = 8.0      # cancel arming if no stable capture by then
+
+# =========================
 # Helpers
 # =========================
 def y_plane(yuv):
-    # Y luma plane of lores YUV420
     if yuv.ndim == 2:  return yuv[:LO_H, :LO_W]
     if yuv.ndim == 3:  return yuv[:, :, 0]
     raise ValueError(f"Unexpected lores shape {yuv.shape}")
@@ -107,6 +115,14 @@ def enqueue_openai(tag, rgb_frame):
 def laplacian_sharpness(gray_u8):
     return cv2.Laplacian(gray_u8, cv2.CV_64F).var()
 
+def center_laplacian(bgr):
+    # compute detail inside center box (to avoid empty scene being "stable")
+    h, w = bgr.shape[:2]
+    cx0, cy0 = int(0.25*w), int(0.25*h)
+    cx1, cy1 = int(0.75*w), int(0.75*h)
+    crop = cv2.cvtColor(bgr[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
+    return laplacian_sharpness(crop)
+
 # =========================
 # Camera (video + still modes)
 # =========================
@@ -118,7 +134,6 @@ video_cfg = picam2.create_video_configuration(
     display="main",
 )
 
-# Fast, sharp still (tune higher if you want)
 STILL_W, STILL_H = 2304, 1296
 still_cfg = picam2.create_still_configuration(
     main={"format":"RGB888","size":(STILL_W, STILL_H)},
@@ -140,7 +155,7 @@ picam2.start()
 cam_lock = threading.Lock()  # guards mode switches and frame grabs
 
 def capture_high_quality(tag: str):
-    with cam_lock:  # block main loop from grabbing frames while we switch modes
+    with cam_lock:
         try:
             try:
                 picam2.set_controls({"AfMode": 1})       # single-shot AF
@@ -149,12 +164,11 @@ def capture_high_quality(tag: str):
                 picam2.set_controls({"AfMode": 2})
 
             picam2.switch_mode(still_cfg)
-            time.sleep(0.18)  # AE/AF settle
+            time.sleep(0.20)  # AE/AF settle
 
-            # Burst and pick sharpest
             frames, scores = [], []
-            for _ in range(3):
-                arr = picam2.capture_array("main")  # RGB888 STILL_WxSTILL_H
+            for _ in range(4):
+                arr = picam2.capture_array("main")
                 gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
                 frames.append(arr)
                 scores.append(laplacian_sharpness(gray))
@@ -180,7 +194,7 @@ def start_capture_thread(tag):
     threading.Thread(target=capture_high_quality, args=(tag,), daemon=True).start()
 
 # =========================
-# Swipe state
+# Swipe + Mode state
 # =========================
 prev_lo = None
 mask_pool = collections.deque(maxlen=POOL_FRAMES)
@@ -192,12 +206,25 @@ last_seen_t_x = last_seen_t_y = 0.0
 y0, y1 = int(ROI_Y0 * LO_H), int(ROI_Y1 * LO_H)
 x0, x1 = int(ROI_X0 * LO_W), int(ROI_X1 * LO_W)
 
+# Mode selection (by swipe)
+MODE_MAP = {
+    "SWIPE_RIGHT": "check_in",
+    "SWIPE_LEFT":  "discard",
+    "SWIPE_UP":    "opened",
+    "SWIPE_DOWN":  "other",
+}
+current_mode = None
+
+# Post-mode arming for still capture
+armed = False
+arm_time = 0.0
+stable_count = 0
+
 try:
     while True:
         now = time.time()
 
-        # Acquire the camera lock non-blocking. If a still capture is in progress,
-        # skip this loop so we don't try to read the (now-missing) 'lores' stream.
+        # If a still capture is in progress, skip reading streams
         if not cam_lock.acquire(blocking=False):
             time.sleep(0.005)
             continue
@@ -211,6 +238,7 @@ try:
         dbg = bgr.copy()
 
         x_norm = y_norm = None
+        normalized_motion = 0.0
 
         if prev_lo is not None:
             diff = cv2.absdiff(lo, prev_lo)
@@ -218,6 +246,9 @@ try:
             pooled = mask_pool[0]
             for i in range(1, len(mask_pool)):
                 pooled = cv2.bitwise_or(pooled, mask_pool[i])
+
+            # normalized motion across full lores
+            normalized_motion = float(pooled.sum()) / (255.0 * LO_W * LO_H)
 
             # Horizontal
             band_h = pooled[y0:y1, :]
@@ -263,14 +294,24 @@ try:
         if len(trace_x) >= 2:
             xs = [p[1] for p in trace_x]; ts = [p[0] for p in trace_x]
             span_x = max(xs) - min(xs); dt = max(1e-3, ts[-1]-ts[0]); vel_x = (xs[-1]-xs[0])/dt
-
         span_y = vel_y = 0.0
         if len(trace_y) >= 2:
             ys = [p[1] for p in trace_y]; ts2 = [p[0] for p in trace_y]
             span_y = max(ys) - min(ys); dt2 = max(1e-3, ts2[-1]-ts2[0]); vel_y = (ys[-1]-ys[0])/dt2
 
+        # Decide swipes -> set MODE (no capture yet)
         gesture_text = ""
         can_fire = (now - last_fire) > COOLDOWN_S
+
+        def set_mode_from(gesture):
+            nonlocal current_mode, armed, arm_time, stable_count
+            m = MODE_MAP.get(gesture)
+            if not m: return
+            current_mode = m
+            armed = True
+            arm_time = now
+            stable_count = 0
+            print(f"[mode] {current_mode} (armed; waiting for stable item)")
 
         # Horizontal gates
         if x_norm is not None:
@@ -280,32 +321,63 @@ try:
             if can_fire:
                 if state_x == "ARM_RIGHT" and x_norm >= R_FIRE:
                     gesture_text = "SWIPE_RIGHT"; last_fire = now; state_x = "IDLE"; trace_x.clear()
-                    print("SWIPE_RIGHT"); start_capture_thread("swipe_right")
+                    print("SWIPE_RIGHT"); set_mode_from("SWIPE_RIGHT")
                 elif state_x == "ARM_LEFT" and x_norm <= L_FIRE:
                     gesture_text = "SWIPE_LEFT";  last_fire = now; state_x = "IDLE"; trace_x.clear()
-                    print("SWIPE_LEFT");  start_capture_thread("swipe_left")
+                    print("SWIPE_LEFT");  set_mode_from("SWIPE_LEFT")
         else:
             if state_x != "IDLE" and (now - last_seen_t_x) > ABSENCE_RESET_S: state_x = "IDLE"
 
-        # Vertical gates (kept for display)
+        # Vertical gates
         if y_norm is not None and gesture_text == "":
             if state_y == "IDLE":
                 if y_norm <= T_ARM: state_y = "ARM_DOWN"
                 elif y_norm >= B_ARM: state_y = "ARM_UP"
             if can_fire:
                 if state_y == "ARM_DOWN" and y_norm >= B_FIRE:
-                    gesture_text = "SWIPE_DOWN"; last_fire = now; state_y = "IDLE"; trace_y.clear(); print("SWIPE_DOWN")
+                    gesture_text = "SWIPE_DOWN"; last_fire = now; state_y = "IDLE"; trace_y.clear()
+                    print("SWIPE_DOWN"); set_mode_from("SWIPE_DOWN")
                 elif state_y == "ARM_UP" and y_norm <= T_FIRE:
-                    gesture_text = "SWIPE_UP";   last_fire = now; state_y = "IDLE"; trace_y.clear(); print("SWIPE_UP")
+                    gesture_text = "SWIPE_UP";   last_fire = now; state_y = "IDLE"; trace_y.clear()
+                    print("SWIPE_UP");   set_mode_from("SWIPE_UP")
         else:
             if state_y != "IDLE" and (now - last_seen_t_y) > ABSENCE_RESET_S: state_y = "IDLE"
 
-        # Span/velocity fallback (horizontal)
+        # Span/velocity fallback (map to mode)
         if can_fire and gesture_text == "" and span_x >= SPAN_THR_X and abs(vel_x) >= VEL_THR_X:
-            gesture_text = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
-            print(f"{gesture_text} (span/vel)")
-            start_capture_thread("swipe_right" if vel_x > 0 else "swipe_left")
-            last_fire = now; state_x = "IDLE"; trace_x.clear()
+            g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
+            print(f"{g} (span/vel)"); set_mode_from(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
+
+        # ---------------------------
+        # Armed: wait-for-stability logic
+        # ---------------------------
+        if armed:
+            # Cancel if too long
+            if (now - arm_time) > ARM_TIMEOUT_S:
+                print("[mode] timeout; disarming without capture")
+                armed = False
+
+            # Wait a minimum delay so user can position item
+            elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
+                stable_count = 0  # don't count yet
+
+            else:
+                # Motion must be very low, and "presence" (detail) sufficiently high
+                lap = center_laplacian(bgr)
+                is_stable = (normalized_motion < MOTION_THR_FRAC) and (lap >= PRESENCE_LAPLACE_MIN)
+                stable_count = stable_count + 1 if is_stable else 0
+
+                if stable_count >= STABILITY_WINDOW_FR:
+                    tag = current_mode or "unknown_mode"
+                    print(f"[mode] stable -> capturing ({tag})")
+                    start_capture_thread(tag)
+                    armed = False  # disarm after capture
+
+            # Draw a simple stability HUD
+            bar_w = int(np.clip(1.0 - (normalized_motion / MOTION_THR_FRAC), 0.0, 1.0) * 200)
+            cv2.rectangle(dbg, (20, 50), (20 + bar_w, 65), (255,255,255), -1)
+            cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR}  lap={int(lap if 'lap' in locals() else 0)}",
+                        (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
 
         # HUD
         cv2.line(dbg, (int(CROSS_L*FRAME_W), 0), (int(CROSS_L*FRAME_W), FRAME_H), (255,255,255), 1)
@@ -315,17 +387,13 @@ try:
         cv2.line(dbg, (0, int(CROSS_B*FRAME_H)), (FRAME_W, int(CROSS_B*FRAME_H)), (255,255,255), 1)
         cv2.rectangle(dbg, (int(ROI_X0*FRAME_W), 0), (int(ROI_X1*FRAME_W), FRAME_H), (255,255,255), 1)
 
-        x_txt = f"x={trace_x[-1][1]:.2f}" if trace_x else "x=--"
-        y_txt = f"y={trace_y[-1][1]:.2f}" if trace_y else "y=--"
+        mode_txt = current_mode if current_mode else "--"
+        cv2.putText(dbg, f"MODE: {mode_txt}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
         if gesture_text:
             cv2.putText(dbg, gesture_text, (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
-        cv2.putText(dbg, f"{x_txt}  STATE_X={state_x}  spanX={span_x:.2f} velX={vel_x:.2f}",
-                    (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        cv2.putText(dbg, f"{y_txt}  STATE_Y={state_y}  spanY={span_y:.2f} velY={vel_y:.2f}",
-                    (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
         if not HEADLESS:
-            cv2.imshow("Swipe (ultrafast LR+UD) + HQ capture", dbg)
+            cv2.imshow("Swipe -> Mode -> Stable capture", dbg)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
         else:
