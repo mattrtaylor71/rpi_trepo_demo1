@@ -73,6 +73,10 @@ SMOOTH_COLS, SMOOTH_ROWS = 5, 5
 POOL_FRAMES = 3                      # a bit more pooling for stability
 HEADLESS = os.environ.get("DISPLAY", "") == ""
 
+CAPTURE_COOLDOWN_S = 0.8   # short refractory period after a capture
+last_capture_t = 0.0       # tracks last successful capture time
+
+
 # =========================
 # Stability / presence gating after a mode is set
 # =========================
@@ -396,21 +400,27 @@ try:
         # Armed: wait-for-stability (adaptive)
         # ---------------------------
         if armed:
-            if (now - arm_time) > ARM_TIMEOUT_S:
+            # give a brief refractory window after a capture
+            if (now - last_capture_t) < CAPTURE_COOLDOWN_S:
+                stable_count = 0
+            elif (now - arm_time) > ARM_TIMEOUT_S:
                 print("[mode] timeout; disarming without capture")
                 armed = False
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
                 stable_count = 0
             else:
                 lap_c = center_laplacian(bgr)
-                # "stable" if motion EMA below dynamic threshold and enough detail in center
                 is_stable = (motion_ema is not None and motion_ema < motion_thr_dyn) and (lap_c >= lap_thr_dyn)
                 stable_count = stable_count + 1 if is_stable else 0
                 if stable_count >= STABILITY_WINDOW_FR:
                     tag = current_mode or "unknown_mode"
                     print(f"[mode] stable -> capturing ({tag})  motion={motion_ema:.4f} thr={motion_thr_dyn:.4f} lap={lap_c:.1f} thr={lap_thr_dyn:.1f}")
                     start_capture_thread(tag)
-                    armed = False
+                    last_capture_t = now        # record capture time
+                    arm_time = now              # ✅ reset the timeout window
+                    stable_count = 0            # reset counter for next item
+                    # keep `armed = True` and keep the current_mode so user can keep going
+
 
                 # HUD for stability
                 # bar shows how close we are to motion threshold
