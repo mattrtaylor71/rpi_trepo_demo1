@@ -36,6 +36,7 @@ class EpaperUI:
         self._worker = _thr.Thread(target=self._run, daemon=True)
         if self.enabled:
             self._worker.start()
+        self.monochrome = True   # mono panel: draw everything on black
 
     # PUBLIC API (non-blocking)
     def show_main(self):
@@ -139,24 +140,30 @@ class EpaperUI:
     def _new_layers(self):
         black = _Image.new('1', (self.W, self.H), 255)
         red   = _Image.new('1', (self.W, self.H), 255)
-        return black, red, _Draw.Draw(black), _Draw.Draw(red)
-        
+        db = _Draw.Draw(black)
+        # In mono, draw “red” onto black as well.
+        dr = db if getattr(self, "monochrome", False) else _Draw.Draw(red)
+        return black, red, db, dr
+
+
     def _push(self, black, red):
         imgB, imgR = black, red
-
-        # Rotate to match the panel’s native orientation
+        # rotate 90/270 if we set rotate_deg earlier
         if getattr(self, "rotate_deg", 0) in (90, 270):
-            imgB = imgB.rotate(self.rotate_deg, expand=True)  # becomes (baseW, baseH)
+            imgB = imgB.rotate(self.rotate_deg, expand=True)
             imgR = imgR.rotate(self.rotate_deg, expand=True)
-        elif getattr(self, "rotate_deg", 0) in (180,):
-            imgB = imgB.rotate(180)
-            imgR = imgR.rotate(180)
-
+        elif getattr(self, "rotate_deg", 0) == 180:
+            imgB = imgB.rotate(180); imgR = imgR.rotate(180)
         if getattr(self, "rotate_180", False):
-            imgB = imgB.rotate(180)
-            imgR = imgR.rotate(180)
+            imgB = imgB.rotate(180); imgR = imgR.rotate(180)
 
-        self.epd.display(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
+        try:
+            # Tri-color signature
+            self.epd.display(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
+        except TypeError:
+            # Mono signature
+            self.epd.display(self.epd.getbuffer(imgB))
+
 
 
     # --- replace EpaperUI._draw_main() with: ---
