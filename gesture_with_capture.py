@@ -86,6 +86,8 @@ MOTION_EMA_ALPHA     = 0.15  # was 0.25 – smoother motion signal, less jitter
 MOTION_THR_SCALE     = 2.3   # was 1.8 – raises the “stable” bar
 MOTION_THR_FLOOR     = 0.004 # was 0.0025 – ignore tiny flicker
 PRESENCE_LAPLACE_MIN = 28.0  # was 18 – require a crisper item
+PRESENCE_LAPLACE_GAIN = 1.3
+
 
 ARM_TIMEOUT_S         = 8.0        # stop waiting if nothing happens
 MOTION_EMA_ALPHA      = 0.25       # EMA smoothing for motion
