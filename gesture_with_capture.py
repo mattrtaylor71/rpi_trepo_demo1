@@ -23,7 +23,7 @@ try:
 except Exception:
     OpenAI = None
 
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # safer default
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5")  # safer default
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 work_q = queue.Queue(maxsize=4)
