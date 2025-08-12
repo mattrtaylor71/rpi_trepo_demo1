@@ -78,14 +78,22 @@ class EpaperUI:
             self.epd = _EPD.EPD()
             self.epd.init()
             self.epd.Clear()
-            # Dimensions: many Waveshare drivers report swapped width/height
-            # Use buffer dims to be safe
-            #self.W, self.H = self.epd.height, self.epd.width
-            self.W, self.H = self.epd.width, self.epd.height
-            # After computing self.W, self.H in _safe_init():
-            self.rotate_180 = False  # set True if needed
 
-            
+            # Panel's native buffer size (as the driver expects)
+            self.baseW, self.baseH = self.epd.width, self.epd.height  # e.g., 104x212 (portrait)
+
+            # We want a landscape UI. If panel is portrait, draw on a swapped canvas
+            # and rotate 90° when pushing to the panel.
+            if self.baseH > self.baseW:
+                self.W, self.H = self.baseH, self.baseW   # logical canvas (landscape)
+                self.rotate_deg = 90                      # rotate CW before send
+            else:
+                self.W, self.H = self.baseW, self.baseH   # already landscape
+                self.rotate_deg = 0
+
+            # Optional: flip 180 after the 90 if the text is upside down relative to your bezel
+            self.rotate_180 = False
+
             # Fonts (prefer repo font, fallback to system)
             base = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             font1 = os.path.join(base, "font", "Font.ttc")
@@ -100,6 +108,7 @@ class EpaperUI:
         except Exception as e:
             print(f"[EPD] init failed: {e}")
             self.enabled = False
+
 
     def _run(self):
         while True:
@@ -131,14 +140,24 @@ class EpaperUI:
         black = _Image.new('1', (self.W, self.H), 255)
         red   = _Image.new('1', (self.W, self.H), 255)
         return black, red, _Draw.Draw(black), _Draw.Draw(red)
-
+        
     def _push(self, black, red):
-        # Then in _push():
+        imgB, imgR = black, red
+
+        # Rotate to match the panel’s native orientation
+        if getattr(self, "rotate_deg", 0) in (90, 270):
+            imgB = imgB.rotate(self.rotate_deg, expand=True)  # becomes (baseW, baseH)
+            imgR = imgR.rotate(self.rotate_deg, expand=True)
+        elif getattr(self, "rotate_deg", 0) in (180,):
+            imgB = imgB.rotate(180)
+            imgR = imgR.rotate(180)
+
         if getattr(self, "rotate_180", False):
-            black = black.rotate(180)
-            red   = red.rotate(180)
-        self.epd.display(self.epd.getbuffer(black), self.epd.getbuffer(red))
-        self.epd.display(self.epd.getbuffer(black), self.epd.getbuffer(red))
+            imgB = imgB.rotate(180)
+            imgR = imgR.rotate(180)
+
+        self.epd.display(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
+
 
     # --- replace EpaperUI._draw_main() with: ---
     def _draw_main(self):
