@@ -80,14 +80,25 @@ last_capture_t = 0.0       # tracks last successful capture time
 # =========================
 # Stability / presence gating after a mode is set
 # =========================
-WAIT_AFTER_SWIPE_S    = 0.6        # shorter grace; user presents item
-STABILITY_WINDOW_FR   = 5          # fewer frames to accept
-MOTION_THR_FLOOR      = 0.0025     # absolute floor for motion (normalized)
-MOTION_THR_SCALE      = 1.8        # dynamic: threshold = max(floor, EMA * scale)
-PRESENCE_LAPLACE_MIN  = 18.0       # minimum edge detail
-PRESENCE_LAPLACE_GAIN = 1.3        # dynamic: lap_thresh = max(min, baseline*gain)
+WAIT_AFTER_SWIPE_S   = 0.9   # was 0.6 – give user more time to present
+STABILITY_WINDOW_FR  = 8     # was 5  – need more consecutive stable frames
+MOTION_EMA_ALPHA     = 0.15  # was 0.25 – smoother motion signal, less jitter
+MOTION_THR_SCALE     = 2.3   # was 1.8 – raises the “stable” bar
+MOTION_THR_FLOOR     = 0.004 # was 0.0025 – ignore tiny flicker
+PRESENCE_LAPLACE_MIN = 28.0  # was 18 – require a crisper item
+
 ARM_TIMEOUT_S         = 8.0        # stop waiting if nothing happens
 MOTION_EMA_ALPHA      = 0.25       # EMA smoothing for motion
+
+# Stability hysteresis / dwell
+ENTER_RELAX = 1.00   # enter when motion < thr * 1.00
+EXIT_RELAX  = 1.20   # reset if motion rises above thr * 1.20
+MIN_STABLE_S = 0.35  # must remain stable at least this long
+CONFIRM_FR   = 2     # extra confirm frames after we think it's stable
+
+stable_since = None
+confirm_left = 0
+
 
 # =========================
 # Helpers
@@ -410,24 +421,48 @@ try:
                 stable_count = 0
             else:
                 lap_c = center_laplacian(bgr)
-                is_stable = (motion_ema is not None and motion_ema < motion_thr_dyn) and (lap_c >= lap_thr_dyn)
-                stable_count = stable_count + 1 if is_stable else 0
-                if stable_count >= STABILITY_WINDOW_FR:
-                    tag = current_mode or "unknown_mode"
-                    print(f"[mode] stable -> capturing ({tag})  motion={motion_ema:.4f} thr={motion_thr_dyn:.4f} lap={lap_c:.1f} thr={lap_thr_dyn:.1f}")
-                    start_capture_thread(tag)
-                    last_capture_t = now        # record capture time
-                    arm_time = now              # ✅ reset the timeout window
-                    stable_count = 0            # reset counter for next item
-                    # keep `armed = True` and keep the current_mode so user can keep going
 
+                thr_enter = motion_thr_dyn * ENTER_RELAX
+                thr_exit  = motion_thr_dyn * EXIT_RELAX
 
-                # HUD for stability
-                # bar shows how close we are to motion threshold
+                below_enter = (motion_ema is not None) and (motion_ema < thr_enter)
+                above_exit  = (motion_ema is not None) and (motion_ema > thr_exit)
+                sharp_enough = (lap_c >= lap_thr_dyn)
+
+                # Hysteresis: once stable, allow a bit of motion before dropping out
+                if above_exit or not sharp_enough:
+                    stable_count = 0
+                    stable_since = None
+                    confirm_left = 0
+                elif below_enter and sharp_enough:
+                    stable_count += 1
+                    if stable_since is None:
+                        stable_since = now
+                    # only proceed if we've been stably below the enter threshold long enough
+                    if (now - stable_since) >= MIN_STABLE_S and stable_count >= STABILITY_WINDOW_FR:
+                        if confirm_left == 0:
+                            confirm_left = CONFIRM_FR   # arm a short confirmation window
+                        else:
+                            confirm_left -= 1
+                            if confirm_left == 0:
+                                tag = current_mode or "unknown_mode"
+                                print(f"[mode] stable -> capturing ({tag})  motion={motion_ema:.4f} thr={motion_thr_dyn:.4f} lap={lap_c:.1f} thr={lap_thr_dyn:.1f}")
+                                start_capture_thread(tag)
+                                last_capture_t = now
+                                arm_time = now        # keep session alive (your multi-item flow)
+                                stable_count = 0
+                                stable_since = None
+                                # remain armed for the next item
+                else:
+                    # mild motion but not above exit; don't accumulate, don't fully reset
+                    confirm_left = 0
+
+                # HUD (optional: reflect hysteresis bands)
                 closeness = 1.0 - np.clip((motion_ema or 0.0) / (motion_thr_dyn or 1e-6), 0.0, 1.0)
                 cv2.rectangle(dbg, (20, 50), (20 + int(200*closeness), 65), (255,255,255), -1)
-                cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR}  lap={int(lap_c)}>={int(lap_thr_dyn)}",
+                cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR} dwell>={MIN_STABLE_S:.2f}s lap={int(lap_c)}>={int(lap_thr_dyn)}",
                             (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
+
 
         # HUD
         cv2.line(dbg, (int(CROSS_L*FRAME_W), 0), (int(CROSS_L*FRAME_W), FRAME_H), (255,255,255), 1)
