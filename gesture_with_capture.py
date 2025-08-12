@@ -82,6 +82,9 @@ class EpaperUI:
             # Use buffer dims to be safe
             #self.W, self.H = self.epd.height, self.epd.width
             self.W, self.H = self.epd.width, self.epd.height
+            # After computing self.W, self.H in _safe_init():
+            self.rotate_180 = False  # set True if needed
+
             
             # Fonts (prefer repo font, fallback to system)
             base = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -130,6 +133,11 @@ class EpaperUI:
         return black, red, _Draw.Draw(black), _Draw.Draw(red)
 
     def _push(self, black, red):
+        # Then in _push():
+        if getattr(self, "rotate_180", False):
+            black = black.rotate(180)
+            red   = red.rotate(180)
+        self.epd.display(self.epd.getbuffer(black), self.epd.getbuffer(red))
         self.epd.display(self.epd.getbuffer(black), self.epd.getbuffer(red))
 
     # --- replace EpaperUI._draw_main() with: ---
