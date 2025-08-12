@@ -162,6 +162,14 @@ CONFIRM_FR   = 2     # extra confirm frames after we think it's stable
 stable_since = None
 confirm_left = 0
 
+# Require removal (low-detail) before re-arming
+CLEAR_LAPLACE_FRAC = 0.65   # consider scene "clear" if center laplacian < 65% of the armed threshold
+CLEAR_WINDOW_FR    = 6      # need this many consecutive clear frames
+
+need_clear  = False
+clear_count = 0
+
+
 
 # =========================
 # Helpers
@@ -292,13 +300,14 @@ lap_baseline = 0.0
 lap_thr_dyn  = PRESENCE_LAPLACE_MIN
 
 def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
-    """Set mode, arm stability, and seed dynamic thresholds from current scene."""
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
+    global need_clear            # <-- add this
     m = MODE_MAP.get(gesture)
     if not m: return
     current_mode = m
     armed = True
+    need_clear = False           # <-- cancel latch on explicit swipe
     arm_time = now_ts
     stable_count = 0
     # derive laplacian baseline from current frame's center crop
@@ -503,6 +512,11 @@ try:
                                 arm_time = now        # keep session alive (your multi-item flow)
                                 stable_count = 0
                                 stable_since = None
+
+                                need_clear = True
+                                armed = False
+                                clear_count = 0
+                                print("[mode] captured; waiting for item removal to re-arm")
                                 # remain armed for the next item
                 else:
                     # mild motion but not above exit; don't accumulate, don't fully reset
@@ -513,6 +527,24 @@ try:
                 cv2.rectangle(dbg, (20, 50), (20 + int(200*closeness), 65), (255,255,255), -1)
                 cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR} dwell>={MIN_STABLE_S:.2f}s lap={int(lap_c)}>={int(lap_thr_dyn)}",
                             (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
+
+        # Re-arm when item is removed (center detail goes low for a few frames)
+        if need_clear:
+            lap_c = center_laplacian(bgr)
+            clear_thr = max(PRESENCE_LAPLACE_MIN * 0.8, lap_thr_dyn * CLEAR_LAPLACE_FRAC)
+            if lap_c < clear_thr:
+                clear_count += 1
+            else:
+                clear_count = 0
+
+            if clear_count >= CLEAR_WINDOW_FR:
+                need_clear = False
+                armed = True
+                arm_time = now
+                print("[mode] scene cleared; re-armed for next item")
+
+            # HUD cue so users know why it’s not firing again
+            cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
 
         # HUD
