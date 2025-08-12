@@ -18,10 +18,10 @@ except Exception:
 class EpaperUI:
     """
     Lightweight UI driver:
-      - main screen with left/right arrows
-      - mode screen ('discard' | 'check_in' | others) + hold prompt
-      - transient 'discarded!' / 'checked in!' banner then fall back to mode screen
-      - timeout to main screen
+      - main screen with left/right arrows (full refresh)
+      - mode screen ('discard' | 'check_in' | others) + hold prompt (partial)
+      - transient 'discarded!' / 'checked in!' banner (partial)
+      - timeout to main screen (full)
     Runs in a single worker thread; posts are coalesced to avoid flicker.
     """
 
@@ -33,6 +33,8 @@ class EpaperUI:
         self.q = _Q(maxsize=8)
         self.cur_mode = None             # 'discard' | 'check_in' | 'opened' | 'other' | None
         self.last_screen = None          # for coalescing
+        self._partial_supported = False
+        self.prevB = self.prevR = None
         self._worker = _thr.Thread(target=self._run, daemon=True)
         if self.enabled:
             self._worker.start()
@@ -61,7 +63,7 @@ class EpaperUI:
 
     # INTERNALS
     def _post(self, msg):
-        if not self.enabled: 
+        if not self.enabled:
             return
         # Drop duplicate consecutive screens to reduce refresh churn
         if msg == self.last_screen:
@@ -78,7 +80,7 @@ class EpaperUI:
         try:
             self.epd = _EPD.EPD()
             self.epd.init()
-            self.epd.Clear()
+            self.epd.Clear()  # only once at boot
 
             # Panel's native buffer size (as the driver expects)
             self.baseW, self.baseH = self.epd.width, self.epd.height  # e.g., 104x212 (portrait)
@@ -106,10 +108,19 @@ class EpaperUI:
                 self.font_big = _Font.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
                 self.font_md  = _Font.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
                 self.font_sm  = _Font.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+
+            # detect partial support (drivers vary)
+            self._partial_supported = any([
+                hasattr(self.epd, "displayPartial"),
+                hasattr(self.epd, "display_Partial"),
+                hasattr(self.epd, "DisplayPartial"),
+                hasattr(self.epd, "init_fast"),
+                hasattr(self.epd, "Init_Partial"),
+                hasattr(self.epd, "init_Partial"),
+            ])
         except Exception as e:
             print(f"[EPD] init failed: {e}")
             self.enabled = False
-
 
     def _run(self):
         while True:
@@ -121,14 +132,14 @@ class EpaperUI:
 
                 kind, payload = msg
                 if kind == "main":
-                    self._draw_main()
+                    self._draw_main()       # full refresh
                 elif kind == "mode":
-                    self._draw_mode(payload)  # payload = mode
+                    self._draw_mode(payload)  # partial
                 elif kind == "captured":
                     mode, ok_text = payload
-                    self._draw_captured(mode, ok_text)   # single refresh; no follow-up redraw
+                    self._draw_captured(mode, ok_text)   # partial
                 elif kind == "timeout":
-                    self._draw_main()
+                    self._draw_main()       # full
                 else:
                     pass
             except Exception as e:
@@ -145,28 +156,71 @@ class EpaperUI:
         dr = db if getattr(self, "monochrome", False) else _Draw.Draw(red)
         return black, red, db, dr
 
-
-    def _push(self, black, red):
-        imgB, imgR = black, red
-        # rotate 90/270 if we set rotate_deg earlier
+    # ----- new: rotation + push helpers for full vs partial -----
+    def _rotate_for_panel(self, img):
+        img_out = img
         if getattr(self, "rotate_deg", 0) in (90, 270):
-            imgB = imgB.rotate(self.rotate_deg, expand=True)
-            imgR = imgR.rotate(self.rotate_deg, expand=True)
+            img_out = img_out.rotate(self.rotate_deg, expand=True)
         elif getattr(self, "rotate_deg", 0) == 180:
-            imgB = imgB.rotate(180); imgR = imgR.rotate(180)
+            img_out = img_out.rotate(180)
         if getattr(self, "rotate_180", False):
-            imgB = imgB.rotate(180); imgR = imgR.rotate(180)
+            img_out = img_out.rotate(180)
+        return img_out
 
+    def _push_full(self, black, red):
+        imgB = self._rotate_for_panel(black)
+        imgR = self._rotate_for_panel(red)
         try:
-            # Tri-color signature
+            if hasattr(self.epd, "init"):
+                self.epd.init()  # ensure full-refresh LUT
+        except Exception:
+            pass
+        try:
             self.epd.display(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
         except TypeError:
-            # Mono signature
             self.epd.display(self.epd.getbuffer(imgB))
+        self.prevB, self.prevR = imgB, imgR
 
+    def _push_partial(self, black, red):
+        imgB = self._rotate_for_panel(black)
+        imgR = self._rotate_for_panel(red)
+        if not self._partial_supported:
+            # fallback: avoid Clear(); normal display often looks like partial
+            try:
+                self.epd.display(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
+            except TypeError:
+                self.epd.display(self.epd.getbuffer(imgB))
+            self.prevB, self.prevR = imgB, imgR
+            return
 
+        # switch to a partial LUT if available
+        try:
+            if   hasattr(self.epd, "init_fast"):     self.epd.init_fast()
+            elif hasattr(self.epd, "Init_Partial"):  self.epd.Init_Partial()
+            elif hasattr(self.epd, "init_Partial"):  self.epd.init_Partial()
+            else:                                    self.epd.init()
+        except Exception:
+            pass
 
-    # --- replace EpaperUI._draw_main() with: ---
+        try:
+            if   hasattr(self.epd, "displayPartial"):
+                try:
+                    self.epd.displayPartial(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
+                except TypeError:
+                    self.epd.displayPartial(self.epd.getbuffer(imgB))
+            elif hasattr(self.epd, "display_Partial"):
+                self.epd.display_Partial(self.epd.getbuffer(imgB))
+            elif hasattr(self.epd, "DisplayPartial"):
+                self.epd.DisplayPartial(self.epd.getbuffer(imgB))
+            else:
+                try:
+                    self.epd.display(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
+                except TypeError:
+                    self.epd.display(self.epd.getbuffer(imgB))
+        finally:
+            self.prevB, self.prevR = imgB, imgR
+
+    # --- main screen: FULL refresh ---
     def _draw_main(self):
         b, r, db, dr = self._new_layers()
         # Headline
@@ -187,23 +241,20 @@ class EpaperUI:
         # Optional thin frame
         db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
 
-        self._push(b, r)
+        self._push_full(b, r)
 
-
-    # --- replace EpaperUI._draw_mode() with: ---
+    # --- mode screen: PARTIAL refresh ---
     def _draw_mode(self, mode):
         b, r, db, dr = self._new_layers()
         title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
         db.text((8, 8), title, font=self.font_big, fill=0)
 
         prompt = "Hold item still ~1ft from camera"
-        # Red prompt for check-in, black otherwise
         if mode == "check_in":
             dr.text((8, 36), prompt, font=self.font_md, fill=0)
         else:
             db.text((8, 36), prompt, font=self.font_md, fill=0)
 
-        # Minimal pictos, smaller size
         y = int(self.H * 0.60)
         arrow_sz = 20
         if mode == "discard":
@@ -214,12 +265,10 @@ class EpaperUI:
             db.rectangle((int(self.W*0.45), y-10, int(self.W*0.55), y+10), outline=0, width=2)
 
         db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
-        self._push(b, r)
+        self._push_partial(b, r)
 
-
-    # --- replace EpaperUI._draw_captured() with a single-refresh version: ---
+    # --- success banner: PARTIAL refresh ---
     def _draw_captured(self, mode, ok_text):
-        # One refresh that ALSO shows the hold prompt; no immediate redraw after.
         b, r, db, dr = self._new_layers()
 
         title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
@@ -227,7 +276,7 @@ class EpaperUI:
 
         # Success banner (red layer text)
         x0, y0, x1, y1 = 8, 36, self.W - 8, 76
-        dr.rectangle((x0, y0, x1, y1), outline=0, fill=255)  # thin outline look
+        dr.rectangle((x0, y0, x1, y1), outline=0, fill=255)
         dr.text((x0 + 10, y0 + 6), ok_text, font=self.font_md, fill=0)
 
         # Keep the usual hold prompt visible under the banner
@@ -242,23 +291,21 @@ class EpaperUI:
             self._arrow(dr, x=int(self.W * 0.70), y=y, size=arrow_sz, direction="right")
 
         db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
-        self._push(b, r)
-
+        self._push_partial(b, r)
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
         s = size
         if direction == "left":
-            # triangle <- and tail
             draw.polygon([(x-s, y), (x, y-s), (x, y+s)], outline=0, fill=0)
             draw.rectangle((x, y-4, x+s, y+4), outline=0, fill=0)
         elif direction == "right":
             draw.polygon([(x+s, y), (x, y-s), (x, y+s)], outline=0, fill=0)
             draw.rectangle((x-s, y-4, x, y+4), outline=0, fill=0)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Create a singleton UI (safe even if epaper libs absent)
 EPD_UI = EpaperUI()
-
 
 # --------------------------
 # OpenAI API (vision)
@@ -268,10 +315,11 @@ try:
 except Exception:
     OpenAI = None
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # or "gpt-5"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 work_q = queue.Queue(maxsize=4)
+
 # --------------------------
 # OpenAI API (vision) + worker
 # --------------------------
@@ -280,7 +328,7 @@ try:
 except Exception:
     OpenAI = None
 
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5")  # safer default
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 work_q = queue.Queue(maxsize=4)
@@ -341,7 +389,6 @@ def enqueue_openai(tag, rgb_frame):
         f.write(jpg)
     print(f"[enqueue] {tag}: saved {path} ({len(jpg)} bytes)")
     if not WORKER_ALIVE:
-        # Don’t silently enqueue if nobody’s consuming
         print("[enqueue][WARN] OpenAI worker not running. Check OPENAI_API_KEY and import. Skipping enqueue.")
         return
     try:
@@ -361,7 +408,6 @@ def q_watchdog():
 threading.Thread(target=q_watchdog, daemon=True).start()
 
 EPD_UI.show_main()
-
 
 # =========================
 # Swipe detector config
@@ -390,45 +436,41 @@ SPAN_THR_Y, VEL_THR_Y = 0.45, 2.2
 
 ENERGY_MIN_FRAC = 0.015
 SMOOTH_COLS, SMOOTH_ROWS = 5, 5
-POOL_FRAMES = 3                      # a bit more pooling for stability
+POOL_FRAMES = 3
 HEADLESS = os.environ.get("DISPLAY", "") == ""
 
-CAPTURE_COOLDOWN_S = 0.8   # short refractory period after a capture
-last_capture_t = 0.0       # tracks last successful capture time
-
+CAPTURE_COOLDOWN_S = 0.8
+last_capture_t = 0.0
 
 # =========================
 # Stability / presence gating after a mode is set
 # =========================
-WAIT_AFTER_SWIPE_S   = 0.9   # was 0.6 – give user more time to present
-STABILITY_WINDOW_FR  = 8     # was 5  – need more consecutive stable frames
-MOTION_EMA_ALPHA     = 0.15  # was 0.25 – smoother motion signal, less jitter
-MOTION_THR_SCALE     = 2.3   # was 1.8 – raises the “stable” bar
-MOTION_THR_FLOOR     = 0.004 # was 0.0025 – ignore tiny flicker
-PRESENCE_LAPLACE_MIN = 28.0  # was 18 – require a crisper item
+WAIT_AFTER_SWIPE_S   = 0.9
+STABILITY_WINDOW_FR  = 8
+MOTION_EMA_ALPHA     = 0.15
+MOTION_THR_SCALE     = 2.3
+MOTION_THR_FLOOR     = 0.004
+PRESENCE_LAPLACE_MIN = 28.0
 PRESENCE_LAPLACE_GAIN = 1.3
 
-
-ARM_TIMEOUT_S         = 8.0        # stop waiting if nothing happens
-MOTION_EMA_ALPHA      = 0.25       # EMA smoothing for motion
+ARM_TIMEOUT_S         = 8.0
+MOTION_EMA_ALPHA      = 0.25
 
 # Stability hysteresis / dwell
-ENTER_RELAX = 1.00   # enter when motion < thr * 1.00
-EXIT_RELAX  = 1.20   # reset if motion rises above thr * 1.20
-MIN_STABLE_S = 0.35  # must remain stable at least this long
-CONFIRM_FR   = 2     # extra confirm frames after we think it's stable
+ENTER_RELAX = 1.00
+EXIT_RELAX  = 1.20
+MIN_STABLE_S = 0.35
+CONFIRM_FR   = 2
 
 stable_since = None
 confirm_left = 0
 
 # Require removal (low-detail) before re-arming
-CLEAR_LAPLACE_FRAC = 0.65   # consider scene "clear" if center laplacian < 65% of the armed threshold
-CLEAR_WINDOW_FR    = 6      # need this many consecutive clear frames
+CLEAR_LAPLACE_FRAC = 0.65
+CLEAR_WINDOW_FR    = 6
 
 need_clear  = False
 clear_count = 0
-
-
 
 # =========================
 # Helpers
@@ -558,21 +600,20 @@ motion_thr_dyn = MOTION_THR_FLOOR
 lap_baseline = 0.0
 lap_thr_dyn  = PRESENCE_LAPLACE_MIN
 
-FLIP_X = True   # <- fixes "left reads as right"
-FLIP_Y = False  # set True if up/down are reversed
+FLIP_X = True   # flips left/right interpretation
+FLIP_Y = False  # set True if up/down feel reversed
 
 def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
-    global need_clear            # <-- add this
+    global need_clear
     m = MODE_MAP.get(gesture)
     if not m: return
     current_mode = m
     armed = True
-    need_clear = False           # <-- cancel latch on explicit swipe
+    need_clear = False
     arm_time = now_ts
     stable_count = 0
-    # derive laplacian baseline from current frame's center crop
     if bgr_for_baseline is not None:
         lap = center_laplacian(bgr_for_baseline)
         lap_baseline = lap
@@ -629,7 +670,6 @@ try:
                     )
                     cv2.line(dbg, (int(x_norm*FRAME_W), 40), (int(x_norm*FRAME_W), 70), (255,255,255), 2)
 
-
             # Vertical (rows) in horizontal band
             band_v = pooled[:, x0:x1]
             row = band_v.astype(np.float32).sum(axis=1)
@@ -645,12 +685,11 @@ try:
                     barv = (row_s / (row_s.max()+1e-6) * 255.0).astype(np.uint8)
                     barv = np.tile(barv[:, None], (1, 40))
                     if FLIP_Y:
-                        barv = barv[::-1, :]  # mirror the debug histogram
+                        barv = barv[::-1, :]
                     barv = cv2.cvtColor(barv, cv2.COLOR_GRAY2BGR)
                     barv = cv2.resize(barv, (40, FRAME_H))
                     dbg[0:FRAME_H, FRAME_W-40:FRAME_W] = barv
                     cv2.line(dbg, (FRAME_W-40, int(y_norm*FRAME_H)), (FRAME_W, int(y_norm*FRAME_H)), (255,255,255), 2)
-
 
             # --- Motion in the central band only (less background noise) ---
             center_band = pooled[int(LO_H*0.20):int(LO_H*0.80), int(LO_W*0.20):int(LO_W*0.80)]
@@ -671,14 +710,9 @@ try:
         prev_lo_blur = lo_blur
 
         # ---- Maintain swipe traces for gates/fallbacks ----
-        # (same as before)
-        # Keep short windows for LR/UD swipes
         SPAN_WINDOW_S = 0.28
-        # Deques exist already: trace_x / trace_y
-        now_ts = now  # alias
+        now_ts = now
 
-        # Compute x_norm / y_norm appended for span/vel
-        # (We already set x_norm / y_norm above)
         while trace_x and (now - trace_x[0][0]) > SPAN_WINDOW_S: trace_x.popleft()
         while trace_y and (now - trace_y[0][0]) > SPAN_WINDOW_S: trace_y.popleft()
         if x_norm is not None: trace_x.append((now, x_norm)); last_seen_t_x = now
@@ -706,7 +740,6 @@ try:
             set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
             EPD_UI.show_mode_prompt(current_mode)
             cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-
 
         # Horizontal gates
         if x_norm is not None:
@@ -747,7 +780,6 @@ try:
         # Armed: wait-for-stability (adaptive)
         # ---------------------------
         if armed:
-            # give a brief refractory window after a capture
             if (now - last_capture_t) < CAPTURE_COOLDOWN_S:
                 stable_count = 0
             elif (now - arm_time) > ARM_TIMEOUT_S:
@@ -766,7 +798,6 @@ try:
                 above_exit  = (motion_ema is not None) and (motion_ema > thr_exit)
                 sharp_enough = (lap_c >= lap_thr_dyn)
 
-                # Hysteresis: once stable, allow a bit of motion before dropping out
                 if above_exit or not sharp_enough:
                     stable_count = 0
                     stable_since = None
@@ -775,10 +806,9 @@ try:
                     stable_count += 1
                     if stable_since is None:
                         stable_since = now
-                    # only proceed if we've been stably below the enter threshold long enough
                     if (now - stable_since) >= MIN_STABLE_S and stable_count >= STABILITY_WINDOW_FR:
                         if confirm_left == 0:
-                            confirm_left = CONFIRM_FR   # arm a short confirmation window
+                            confirm_left = CONFIRM_FR
                         else:
                             confirm_left -= 1
                             if confirm_left == 0:
@@ -787,7 +817,7 @@ try:
                                 start_capture_thread(tag)
                                 EPD_UI.show_captured(tag, "checked in!" if tag == "check_in" else "discarded!")
                                 last_capture_t = now
-                                arm_time = now        # keep session alive (your multi-item flow)
+                                arm_time = now
                                 stable_count = 0
                                 stable_since = None
 
@@ -795,12 +825,10 @@ try:
                                 armed = False
                                 clear_count = 0
                                 print("[mode] captured; waiting for item removal to re-arm")
-                                # remain armed for the next item
                 else:
-                    # mild motion but not above exit; don't accumulate, don't fully reset
                     confirm_left = 0
 
-                # HUD (optional: reflect hysteresis bands)
+                # HUD (optional)
                 closeness = 1.0 - np.clip((motion_ema or 0.0) / (motion_thr_dyn or 1e-6), 0.0, 1.0)
                 cv2.rectangle(dbg, (20, 50), (20 + int(200*closeness), 65), (255,255,255), -1)
                 cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR} dwell>={MIN_STABLE_S:.2f}s lap={int(lap_c)}>={int(lap_thr_dyn)}",
@@ -821,9 +849,7 @@ try:
                 arm_time = now
                 print("[mode] scene cleared; re-armed for next item")
 
-            # HUD cue so users know why it’s not firing again
             cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-
 
         # HUD
         cv2.line(dbg, (int(CROSS_L*FRAME_W), 0), (int(CROSS_L*FRAME_W), FRAME_H), (255,255,255), 1)
