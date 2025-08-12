@@ -76,11 +76,11 @@ HEADLESS = os.environ.get("DISPLAY", "") == ""
 # =========================
 # Stability / presence gating after a mode is set
 # =========================
-WAIT_AFTER_SWIPE_S    = 1.00     # don't snap immediately; give time to present item
-STABILITY_WINDOW_FR   = 8        # need this many consecutive stable frames
-MOTION_THR_FRAC       = 0.003    # normalized motion energy threshold for "stable"
-PRESENCE_LAPLACE_MIN  = 25.0     # detail threshold (Laplacian var) to ensure object exists
-ARM_TIMEOUT_S         = 8.0      # cancel arming if no stable capture by then
+WAIT_AFTER_SWIPE_S    = 1.00     # time to position the item
+STABILITY_WINDOW_FR   = 8        # consecutive stable frames needed
+MOTION_THR_FRAC       = 0.003    # lower = stricter
+PRESENCE_LAPLACE_MIN  = 25.0     # ensure there's “detail” in center crop
+ARM_TIMEOUT_S         = 8.0      # give up if not stable by then
 
 # =========================
 # Helpers
@@ -116,7 +116,6 @@ def laplacian_sharpness(gray_u8):
     return cv2.Laplacian(gray_u8, cv2.CV_64F).var()
 
 def center_laplacian(bgr):
-    # compute detail inside center box (to avoid empty scene being "stable")
     h, w = bgr.shape[:2]
     cx0, cy0 = int(0.25*w), int(0.25*h)
     cx1, cy1 = int(0.75*w), int(0.75*h)
@@ -206,7 +205,6 @@ last_seen_t_x = last_seen_t_y = 0.0
 y0, y1 = int(ROI_Y0 * LO_H), int(ROI_Y1 * LO_H)
 x0, x1 = int(ROI_X0 * LO_W), int(ROI_X1 * LO_W)
 
-# Mode selection (by swipe)
 MODE_MAP = {
     "SWIPE_RIGHT": "check_in",
     "SWIPE_LEFT":  "discard",
@@ -214,17 +212,27 @@ MODE_MAP = {
     "SWIPE_DOWN":  "other",
 }
 current_mode = None
-
-# Post-mode arming for still capture
 armed = False
 arm_time = 0.0
 stable_count = 0
+
+def set_mode_from(gesture: str, now_ts: float):
+    """Set global mode and arm the stable-capture logic."""
+    global current_mode, armed, arm_time, stable_count
+    m = MODE_MAP.get(gesture)
+    if not m:
+        return
+    current_mode = m
+    armed = True
+    arm_time = now_ts
+    stable_count = 0
+    print(f"[mode] {current_mode} (armed; waiting for stable item)")
 
 try:
     while True:
         now = time.time()
 
-        # If a still capture is in progress, skip reading streams
+        # Skip reads during still capture
         if not cam_lock.acquire(blocking=False):
             time.sleep(0.005)
             continue
@@ -239,6 +247,7 @@ try:
 
         x_norm = y_norm = None
         normalized_motion = 0.0
+        lap = 0.0
 
         if prev_lo is not None:
             diff = cv2.absdiff(lo, prev_lo)
@@ -247,7 +256,6 @@ try:
             for i in range(1, len(mask_pool)):
                 pooled = cv2.bitwise_or(pooled, mask_pool[i])
 
-            # normalized motion across full lores
             normalized_motion = float(pooled.sum()) / (255.0 * LO_W * LO_H)
 
             # Horizontal
@@ -299,19 +307,9 @@ try:
             ys = [p[1] for p in trace_y]; ts2 = [p[0] for p in trace_y]
             span_y = max(ys) - min(ys); dt2 = max(1e-3, ts2[-1]-ts2[0]); vel_y = (ys[-1]-ys[0])/dt2
 
-        # Decide swipes -> set MODE (no capture yet)
+        # Swipes -> MODE (no immediate capture)
         gesture_text = ""
         can_fire = (now - last_fire) > COOLDOWN_S
-
-        def set_mode_from(gesture):
-            nonlocal current_mode, armed, arm_time, stable_count
-            m = MODE_MAP.get(gesture)
-            if not m: return
-            current_mode = m
-            armed = True
-            arm_time = now
-            stable_count = 0
-            print(f"[mode] {current_mode} (armed; waiting for stable item)")
 
         # Horizontal gates
         if x_norm is not None:
@@ -321,10 +319,10 @@ try:
             if can_fire:
                 if state_x == "ARM_RIGHT" and x_norm >= R_FIRE:
                     gesture_text = "SWIPE_RIGHT"; last_fire = now; state_x = "IDLE"; trace_x.clear()
-                    print("SWIPE_RIGHT"); set_mode_from("SWIPE_RIGHT")
+                    print("SWIPE_RIGHT"); set_mode_from("SWIPE_RIGHT", now)
                 elif state_x == "ARM_LEFT" and x_norm <= L_FIRE:
                     gesture_text = "SWIPE_LEFT";  last_fire = now; state_x = "IDLE"; trace_x.clear()
-                    print("SWIPE_LEFT");  set_mode_from("SWIPE_LEFT")
+                    print("SWIPE_LEFT");  set_mode_from("SWIPE_LEFT", now)
         else:
             if state_x != "IDLE" and (now - last_seen_t_x) > ABSENCE_RESET_S: state_x = "IDLE"
 
@@ -336,47 +334,41 @@ try:
             if can_fire:
                 if state_y == "ARM_DOWN" and y_norm >= B_FIRE:
                     gesture_text = "SWIPE_DOWN"; last_fire = now; state_y = "IDLE"; trace_y.clear()
-                    print("SWIPE_DOWN"); set_mode_from("SWIPE_DOWN")
+                    print("SWIPE_DOWN"); set_mode_from("SWIPE_DOWN", now)
                 elif state_y == "ARM_UP" and y_norm <= T_FIRE:
                     gesture_text = "SWIPE_UP";   last_fire = now; state_y = "IDLE"; trace_y.clear()
-                    print("SWIPE_UP");   set_mode_from("SWIPE_UP")
+                    print("SWIPE_UP");   set_mode_from("SWIPE_UP", now)
         else:
             if state_y != "IDLE" and (now - last_seen_t_y) > ABSENCE_RESET_S: state_y = "IDLE"
 
-        # Span/velocity fallback (map to mode)
+        # Span/velocity fallback
         if can_fire and gesture_text == "" and span_x >= SPAN_THR_X and abs(vel_x) >= VEL_THR_X:
             g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
-            print(f"{g} (span/vel)"); set_mode_from(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
+            print(f"{g} (span/vel)"); set_mode_from(g, now); last_fire = now; state_x = "IDLE"; trace_x.clear()
 
         # ---------------------------
-        # Armed: wait-for-stability logic
+        # Armed: wait-for-stability
         # ---------------------------
         if armed:
-            # Cancel if too long
             if (now - arm_time) > ARM_TIMEOUT_S:
                 print("[mode] timeout; disarming without capture")
                 armed = False
-
-            # Wait a minimum delay so user can position item
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
-                stable_count = 0  # don't count yet
-
+                stable_count = 0
             else:
-                # Motion must be very low, and "presence" (detail) sufficiently high
                 lap = center_laplacian(bgr)
                 is_stable = (normalized_motion < MOTION_THR_FRAC) and (lap >= PRESENCE_LAPLACE_MIN)
                 stable_count = stable_count + 1 if is_stable else 0
-
                 if stable_count >= STABILITY_WINDOW_FR:
                     tag = current_mode or "unknown_mode"
                     print(f"[mode] stable -> capturing ({tag})")
                     start_capture_thread(tag)
-                    armed = False  # disarm after capture
+                    armed = False
 
-            # Draw a simple stability HUD
+            # HUD: stability bar
             bar_w = int(np.clip(1.0 - (normalized_motion / MOTION_THR_FRAC), 0.0, 1.0) * 200)
             cv2.rectangle(dbg, (20, 50), (20 + bar_w, 65), (255,255,255), -1)
-            cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR}  lap={int(lap if 'lap' in locals() else 0)}",
+            cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR}  lap={int(lap)}",
                         (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
 
         # HUD
