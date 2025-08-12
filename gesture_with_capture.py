@@ -80,7 +80,9 @@ class EpaperUI:
             self.epd.Clear()
             # Dimensions: many Waveshare drivers report swapped width/height
             # Use buffer dims to be safe
-            self.W, self.H = self.epd.height, self.epd.width
+            #self.W, self.H = self.epd.height, self.epd.width
+            self.W, self.H = self.epd.width, self.epd.height
+            
             # Fonts (prefer repo font, fallback to system)
             base = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             font1 = os.path.join(base, "font", "Font.ttc")
@@ -111,12 +113,7 @@ class EpaperUI:
                     self._draw_mode(payload)  # payload = mode
                 elif kind == "captured":
                     mode, ok_text = payload
-                    self._draw_captured(mode, ok_text)
-                    # brief dwell then return to mode prompt
-                    time.sleep(1.2)
-                    # Only return if we're still in that mode
-                    if self.cur_mode == mode:
-                        self._draw_mode(mode)
+                    self._draw_captured(mode, ok_text)   # single refresh; no follow-up redraw
                 elif kind == "timeout":
                     self._draw_main()
                 else:
@@ -135,57 +132,84 @@ class EpaperUI:
     def _push(self, black, red):
         self.epd.display(self.epd.getbuffer(black), self.epd.getbuffer(red))
 
+    # --- replace EpaperUI._draw_main() with: ---
     def _draw_main(self):
         b, r, db, dr = self._new_layers()
-        # Title
-        db.text((8, 6), "Trepo", font=self.font_big, fill=0)
-        db.text((8, 34), "Swipe to choose mode", font=self.font_md, fill=0)
-        # Arrows area
-        h_c = int(self.H*0.62)
-        # Left arrow (DISCARD)
-        self._arrow(db, x=int(self.W*0.22), y=h_c, size=28, direction="left")
-        db.text((int(self.W*0.14), h_c+24), "discard", font=self.font_sm, fill=0)
+        # Headline
+        db.text((8, 8), "Swipe to choose mode", font=self.font_md, fill=0)
+
+        # Arrows (smaller, centered horizontally)
+        y = int(self.H * 0.60)
+        arrow_sz = 20
+
+        # Left arrow (DISCARD) in black
+        self._arrow(db, x=int(self.W * 0.30), y=y, size=arrow_sz, direction="left")
+        db.text((int(self.W * 0.24), y + 18), "discard", font=self.font_sm, fill=0)
+
         # Right arrow (CHECK-IN) in red
-        self._arrow(dr, x=int(self.W*0.78), y=h_c, size=28, direction="right")
-        dr.text((int(self.W*0.72), h_c+24), "check-in", font=self.font_sm, fill=0)
-        # Frame
-        db.rectangle((0,0,self.W-1,self.H-1), outline=0, width=1)
+        self._arrow(dr, x=int(self.W * 0.70), y=y, size=arrow_sz, direction="right")
+        dr.text((int(self.W * 0.64), y + 18), "check-in", font=self.font_sm, fill=0)
+
+        # Optional thin frame
+        db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
+
         self._push(b, r)
 
+
+    # --- replace EpaperUI._draw_mode() with: ---
     def _draw_mode(self, mode):
         b, r, db, dr = self._new_layers()
         title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
-        db.text((8, 6), title, font=self.font_big, fill=0)
+        db.text((8, 8), title, font=self.font_big, fill=0)
+
         prompt = "Hold item still ~1ft from camera"
-        # Use red prompt for check-in, black for discard
+        # Red prompt for check-in, black otherwise
         if mode == "check_in":
-            dr.text((8, 40), prompt, font=self.font_md, fill=0)
+            dr.text((8, 36), prompt, font=self.font_md, fill=0)
         else:
-            db.text((8, 40), prompt, font=self.font_md, fill=0)
-        # Minimal pictos
-        y = int(self.H*0.62)
+            db.text((8, 36), prompt, font=self.font_md, fill=0)
+
+        # Minimal pictos, smaller size
+        y = int(self.H * 0.60)
+        arrow_sz = 20
         if mode == "discard":
-            self._arrow(db, x=int(self.W*0.22), y=y, size=28, direction="left")
+            self._arrow(db, x=int(self.W * 0.30), y=y, size=arrow_sz, direction="left")
         elif mode == "check_in":
-            self._arrow(dr, x=int(self.W*0.78), y=y, size=28, direction="right")
+            self._arrow(dr, x=int(self.W * 0.70), y=y, size=arrow_sz, direction="right")
         else:
             db.rectangle((int(self.W*0.45), y-10, int(self.W*0.55), y+10), outline=0, width=2)
-        db.rectangle((0,0,self.W-1,self.H-1), outline=0, width=1)
+
+        db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
         self._push(b, r)
 
+
+    # --- replace EpaperUI._draw_captured() with a single-refresh version: ---
     def _draw_captured(self, mode, ok_text):
+        # One refresh that ALSO shows the hold prompt; no immediate redraw after.
         b, r, db, dr = self._new_layers()
+
         title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
-        db.text((8, 6), title, font=self.font_big, fill=0)
-        # Banner
-        x0, y0, x1, y1 = 8, 44, self.W-8, 90
-        # Red banner for success for either mode
-        dr.rectangle((x0,y0,x1,y1), outline=0, fill=255)  # outline only (white fill); text will be red layer
-        dr.text((x0+10, y0+8), ok_text, font=self.font_big, fill=0)
-        # Sub-prompt stays visible so user knows we're still in this session
-        db.text((8, 100), "Hold item still ~1ft from camera", font=self.font_md, fill=0)
-        db.rectangle((0,0,self.W-1,self.H-1), outline=0, width=1)
+        db.text((8, 8), title, font=self.font_big, fill=0)
+
+        # Success banner (red layer text)
+        x0, y0, x1, y1 = 8, 36, self.W - 8, 76
+        dr.rectangle((x0, y0, x1, y1), outline=0, fill=255)  # thin outline look
+        dr.text((x0 + 10, y0 + 6), ok_text, font=self.font_md, fill=0)
+
+        # Keep the usual hold prompt visible under the banner
+        db.text((8, 84), "Hold item still ~1ft from camera", font=self.font_md, fill=0)
+
+        # Small mode pictos again (consistent with _draw_mode)
+        y = int(self.H * 0.60)
+        arrow_sz = 20
+        if mode == "discard":
+            self._arrow(db, x=int(self.W * 0.30), y=y, size=arrow_sz, direction="left")
+        elif mode == "check_in":
+            self._arrow(dr, x=int(self.W * 0.70), y=y, size=arrow_sz, direction="right")
+
+        db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
         self._push(b, r)
+
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
         s = size
