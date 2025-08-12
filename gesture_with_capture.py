@@ -348,11 +348,14 @@ try:
         can_fire = (now - last_fire) > COOLDOWN_S
 
         def set_mode_and_seed(gesture: str):
-            # seed dynamic motion threshold at arm time
-            nonlocal motion_thr_dyn
-            motion_thr_dyn = max(MOTION_THR_FLOOR, (motion_ema or MOTION_THR_FLOOR) * MOTION_THR_SCALE)
+            global motion_thr_dyn
+            motion_thr_dyn = max(
+                MOTION_THR_FLOOR,
+                (motion_ema or MOTION_THR_FLOOR) * MOTION_THR_SCALE
+            )
             set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
             cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
 
         # Horizontal gates
         if x_norm is not None:
