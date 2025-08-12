@@ -558,6 +558,9 @@ motion_thr_dyn = MOTION_THR_FLOOR
 lap_baseline = 0.0
 lap_thr_dyn  = PRESENCE_LAPLACE_MIN
 
+FLIP_X = True   # <- fixes "left reads as right"
+FLIP_Y = False  # set True if up/down are reversed
+
 def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
@@ -613,11 +616,19 @@ try:
                 xs = np.arange(LO_W, dtype=np.float32)
                 wsum = col_s.sum()
                 if wsum > 1e-3:
-                    cx = float((col_s * xs).sum() / wsum)
-                    x_norm = cx / LO_W
+                    cx_raw = float((col_s * xs).sum() / wsum) / LO_W
+                    x_norm = (1.0 - cx_raw) if FLIP_X else cx_raw
+
+                    # debug bar across the top
                     bar = (col_s / (col_s.max()+1e-6) * 255.0).astype(np.uint8)
-                    dbg[0:40, 0:FRAME_W] = cv2.resize(cv2.cvtColor(np.tile(bar,(40,1)), cv2.COLOR_GRAY2BGR),(FRAME_W,40))
+                    if FLIP_X:
+                        bar = bar[::-1]  # mirror the debug histogram too
+                    dbg[0:40, 0:FRAME_W] = cv2.resize(
+                        cv2.cvtColor(np.tile(bar, (40, 1)), cv2.COLOR_GRAY2BGR),
+                        (FRAME_W, 40)
+                    )
                     cv2.line(dbg, (int(x_norm*FRAME_W), 40), (int(x_norm*FRAME_W), 70), (255,255,255), 2)
+
 
             # Vertical (rows) in horizontal band
             band_v = pooled[:, x0:x1]
@@ -627,14 +638,19 @@ try:
                 ys = np.arange(LO_H, dtype=np.float32)
                 wsum = row_s.sum()
                 if wsum > 1e-3:
-                    cy = float((row_s * ys).sum() / wsum)
-                    y_norm = cy / LO_H
+                    cy_raw = float((row_s * ys).sum() / wsum) / LO_H
+                    y_norm = (1.0 - cy_raw) if FLIP_Y else cy_raw
+
+                    # debug bar on the right edge
                     barv = (row_s / (row_s.max()+1e-6) * 255.0).astype(np.uint8)
-                    barv = np.tile(barv[:,None], (1,40))
+                    barv = np.tile(barv[:, None], (1, 40))
+                    if FLIP_Y:
+                        barv = barv[::-1, :]  # mirror the debug histogram
                     barv = cv2.cvtColor(barv, cv2.COLOR_GRAY2BGR)
                     barv = cv2.resize(barv, (40, FRAME_H))
                     dbg[0:FRAME_H, FRAME_W-40:FRAME_W] = barv
                     cv2.line(dbg, (FRAME_W-40, int(y_norm*FRAME_H)), (FRAME_W, int(y_norm*FRAME_H)), (255,255,255), 2)
+
 
             # --- Motion in the central band only (less background noise) ---
             center_band = pooled[int(LO_H*0.20):int(LO_H*0.80), int(LO_W*0.20):int(LO_W*0.80)]
