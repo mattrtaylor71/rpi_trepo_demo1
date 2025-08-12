@@ -93,47 +93,126 @@ def smooth1d(v, k):
     kernel = np.ones(ksz, dtype=np.float32) / ksz
     return np.convolve(v, kernel, mode="same")
 
-def save_and_enqueue(tag, rgb_frame):
-    """Save a JPEG and enqueue to OpenAI worker."""
+def jpeg_bytes_from_rgb(rgb, quality=92):
+    ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                           [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok: return None
+    return jpg.tobytes()
+
+def enqueue_openai(tag, rgb_frame):
     os.makedirs("captures", exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     path = f"captures/{tag}_{ts}.jpg"
-    # Encode as JPEG (quality 90)
-    ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR),
-                           [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
+    jpg = jpeg_bytes_from_rgb(rgb_frame, quality=92)
+    if jpg is None:
         print(f"[{tag}] JPEG encode failed")
         return
     with open(path, "wb") as f:
-        f.write(jpg.tobytes())
+        f.write(jpg)
     print(f"[{tag}] saved {path}")
     try:
-        work_q.put_nowait((tag, jpg.tobytes()))
+        work_q.put_nowait((tag, jpg))
     except queue.Full:
         print(f"[{tag}] queue full; skipping upload")
 
+def laplacian_sharpness(gray_u8):
+    # higher = sharper
+    return cv2.Laplacian(gray_u8, cv2.CV_64F).var()
+
 # =========================
-# Camera
+# Camera (video + still modes)
 # =========================
 picam2 = Picamera2()
-config = picam2.create_video_configuration(
+
+video_cfg = picam2.create_video_configuration(
     main={"format": "RGB888", "size": (FRAME_W, FRAME_H)},
     lores={"format": "YUV420", "size": (LO_W, LO_H)},
     display="main",
 )
-picam2.configure(config)
+
+# Choose a sensible still size for IMX708; 2304x1296 is fast & sharp.
+# You can push higher (e.g., 4056x3040) but it’s slower & heavier.
+STILL_W, STILL_H = 2304, 1296
+still_cfg = picam2.create_still_configuration(
+    main={"format": "RGB888", "size": (STILL_W, STILL_H)},
+    display=None,
+)
+
+picam2.configure(video_cfg)
+
+# Fast preview tuning
 try:
     picam2.set_controls({
-        "AeEnable": True, "AwbEnable": True, "AfMode": 2,
-        "FrameDurationLimits": (10000, 10000),   # ~100 fps (will cap if needed)
+        "AeEnable": True, "AwbEnable": True,
+        "AfMode": 2,                       # continuous AF for preview
+        "FrameDurationLimits": (10000, 10000),  # ~100 fps (device may cap lower)
         "AnalogueGain": 12.0,
     })
 except Exception:
     pass
+
 picam2.start()
 
+cam_lock = threading.Lock()  # protect mode switches & controls
+
+def capture_high_quality(tag: str):
+    """Switch to still mode, AF/AE settle, capture burst, pick sharpest, enqueue."""
+    with cam_lock:
+        try:
+            # Give AF a kick to refocus at the object distance
+            try:
+                picam2.set_controls({"AfMode": 1})         # single-shot AF if supported
+                picam2.set_controls({"AfTrigger": 1})      # start AF
+            except Exception:
+                # fall back to continuous
+                picam2.set_controls({"AfMode": 2})
+
+            # Switch to still mode
+            picam2.switch_mode(still_cfg)
+            # small settle for AE/AF in still mode
+            time.sleep(0.18)
+
+            # Burst capture and choose sharpest
+            frames = []
+            scores = []
+            N = 3
+            for _ in range(N):
+                arr = picam2.capture_array("main")  # RGB888 at STILL_W x STILL_H
+                gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+                frames.append(arr)
+                scores.append(laplacian_sharpness(gray))
+                # brief pause lets AF/AE refine
+                time.sleep(0.05)
+
+            best_idx = int(np.argmax(scores))
+            best = frames[best_idx]
+            print(f"[{tag}] burst sharpness scores: {[round(s,1) for s in scores]} -> pick {best_idx}")
+
+            enqueue_openai(tag, best)
+
+        except Exception as e:
+            print(f"[{tag}] capture error: {e}")
+
+        finally:
+            # Return to fast video mode and restore fast preview controls
+            try:
+                picam2.switch_mode(video_cfg)
+                picam2.set_controls({
+                    "AeEnable": True, "AwbEnable": True,
+                    "AfMode": 2,
+                    "FrameDurationLimits": (10000, 10000),
+                    "AnalogueGain": 12.0,
+                })
+            except Exception:
+                pass
+
+def start_capture_thread(tag, rgb_preview_unused=None):
+    # launch in background so the UI / swipe loop stays snappy
+    t = threading.Thread(target=capture_high_quality, args=(tag,), daemon=True)
+    t.start()
+
 # =========================
-# State
+# Swipe detection state
 # =========================
 prev_lo = None
 mask_pool = collections.deque(maxlen=POOL_FRAMES)
@@ -156,7 +235,7 @@ try:
 
         # Frames
         lo  = y_plane(picam2.capture_array("lores"))
-        rgb = picam2.capture_array("main")   # keep this fresh for capture
+        rgb = picam2.capture_array("main")   # fast preview
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         dbg = bgr.copy()
 
@@ -237,11 +316,11 @@ try:
                 if state_x == "ARM_RIGHT" and x_norm >= R_FIRE:
                     gesture_text = "SWIPE_RIGHT"; last_fire = now; state_x = "IDLE"; trace_x.clear()
                     print("SWIPE_RIGHT")
-                    save_and_enqueue("swipe_right", rgb)
+                    start_capture_thread("swipe_right")
                 elif state_x == "ARM_LEFT" and x_norm <= L_FIRE:
                     gesture_text = "SWIPE_LEFT";  last_fire = now; state_x = "IDLE"; trace_x.clear()
                     print("SWIPE_LEFT")
-                    save_and_enqueue("swipe_left", rgb)
+                    start_capture_thread("swipe_left")
         else:
             if state_x != "IDLE" and (now - last_seen_t_x) > ABSENCE_RESET_S:
                 state_x = "IDLE"
@@ -266,11 +345,11 @@ try:
         if can_fire and gesture_text == "" and span_x >= SPAN_THR_X and abs(vel_x) >= VEL_THR_X:
             if vel_x > 0:
                 print("SWIPE_RIGHT (span/vel)")
-                save_and_enqueue("swipe_right", rgb)
+                start_capture_thread("swipe_right")
                 gesture_text = "SWIPE_RIGHT"
             else:
                 print("SWIPE_LEFT (span/vel)")
-                save_and_enqueue("swipe_left", rgb)
+                start_capture_thread("swipe_left")
                 gesture_text = "SWIPE_LEFT"
             last_fire = now; state_x = "IDLE"; trace_x.clear()
 
@@ -279,7 +358,7 @@ try:
         cv2.line(dbg, (int(CROSS_R*FRAME_W), 0), (int(CROSS_R*FRAME_W), FRAME_H), (255,255,255), 1)
         cv2.rectangle(dbg, (0, int(ROI_Y0*FRAME_H)), (FRAME_W, int(ROI_Y1*FRAME_H)), (255,255,255), 1)
         cv2.line(dbg, (0, int(CROSS_T*FRAME_H)), (FRAME_W, int(CROSS_T*FRAME_H)), (255,255,255), 1)
-        cv2.line(dbg, (0, int(CROSS_B*FRAME_H)), (FRAME_W, int(CROSS_B*FRAME_H)), (255,255,255), 1)
+        cv2.line(dbg, (0, int(CROSS_B*FRAME_H)), (FRAME_W, int(CROSS_B*FRAME_H)), 1)
         cv2.rectangle(dbg, (int(ROI_X0*FRAME_W), 0), (int(ROI_X1*FRAME_W), FRAME_H), (255,255,255), 1)
 
         x_txt = f"x={trace_x[-1][1]:.2f}" if trace_x else "x=--"
@@ -292,7 +371,7 @@ try:
                     (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
         if not HEADLESS:
-            cv2.imshow("Swipe (ultrafast LR+UD) + capture", dbg)
+            cv2.imshow("Swipe (ultrafast LR+UD) + HQ capture", dbg)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
         else:
