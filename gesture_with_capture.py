@@ -70,17 +70,20 @@ SPAN_THR_Y, VEL_THR_Y = 0.45, 2.2
 
 ENERGY_MIN_FRAC = 0.015
 SMOOTH_COLS, SMOOTH_ROWS = 5, 5
-POOL_FRAMES = 2
+POOL_FRAMES = 3                      # a bit more pooling for stability
 HEADLESS = os.environ.get("DISPLAY", "") == ""
 
 # =========================
 # Stability / presence gating after a mode is set
 # =========================
-WAIT_AFTER_SWIPE_S    = 1.00     # time to position the item
-STABILITY_WINDOW_FR   = 8        # consecutive stable frames needed
-MOTION_THR_FRAC       = 0.003    # lower = stricter
-PRESENCE_LAPLACE_MIN  = 25.0     # ensure there's “detail” in center crop
-ARM_TIMEOUT_S         = 8.0      # give up if not stable by then
+WAIT_AFTER_SWIPE_S    = 0.6        # shorter grace; user presents item
+STABILITY_WINDOW_FR   = 5          # fewer frames to accept
+MOTION_THR_FLOOR      = 0.0025     # absolute floor for motion (normalized)
+MOTION_THR_SCALE      = 1.8        # dynamic: threshold = max(floor, EMA * scale)
+PRESENCE_LAPLACE_MIN  = 18.0       # minimum edge detail
+PRESENCE_LAPLACE_GAIN = 1.3        # dynamic: lap_thresh = max(min, baseline*gain)
+ARM_TIMEOUT_S         = 8.0        # stop waiting if nothing happens
+MOTION_EMA_ALPHA      = 0.25       # EMA smoothing for motion
 
 # =========================
 # Helpers
@@ -163,7 +166,7 @@ def capture_high_quality(tag: str):
                 picam2.set_controls({"AfMode": 2})
 
             picam2.switch_mode(still_cfg)
-            time.sleep(0.20)  # AE/AF settle
+            time.sleep(0.22)  # AE/AF settle
 
             frames, scores = [], []
             for _ in range(4):
@@ -195,7 +198,7 @@ def start_capture_thread(tag):
 # =========================
 # Swipe + Mode state
 # =========================
-prev_lo = None
+prev_lo_blur = None
 mask_pool = collections.deque(maxlen=POOL_FRAMES)
 trace_x, trace_y = collections.deque(), collections.deque()
 state_x = state_y = "IDLE"
@@ -216,17 +219,28 @@ armed = False
 arm_time = 0.0
 stable_count = 0
 
-def set_mode_from(gesture: str, now_ts: float):
-    """Set global mode and arm the stable-capture logic."""
+# Adaptive stability thresholds
+motion_ema = None
+motion_thr_dyn = MOTION_THR_FLOOR
+lap_baseline = 0.0
+lap_thr_dyn  = PRESENCE_LAPLACE_MIN
+
+def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
+    """Set mode, arm stability, and seed dynamic thresholds from current scene."""
     global current_mode, armed, arm_time, stable_count
+    global motion_thr_dyn, lap_baseline, lap_thr_dyn
     m = MODE_MAP.get(gesture)
-    if not m:
-        return
+    if not m: return
     current_mode = m
     armed = True
     arm_time = now_ts
     stable_count = 0
-    print(f"[mode] {current_mode} (armed; waiting for stable item)")
+    # derive laplacian baseline from current frame's center crop
+    if bgr_for_baseline is not None:
+        lap = center_laplacian(bgr_for_baseline)
+        lap_baseline = lap
+        lap_thr_dyn  = max(PRESENCE_LAPLACE_MIN, lap * PRESENCE_LAPLACE_GAIN)
+    print(f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f}  lap_thr={lap_thr_dyn:.1f}")
 
 try:
     while True:
@@ -246,19 +260,18 @@ try:
         dbg = bgr.copy()
 
         x_norm = y_norm = None
-        normalized_motion = 0.0
-        lap = 0.0
 
-        if prev_lo is not None:
-            diff = cv2.absdiff(lo, prev_lo)
+        # --- Preprocess lores for robust motion: blur + diff + pool ---
+        lo_blur = cv2.GaussianBlur(lo, (3,3), 0)
+
+        if prev_lo_blur is not None:
+            diff = cv2.absdiff(lo_blur, prev_lo_blur)
             mask_pool.append(diff)
             pooled = mask_pool[0]
             for i in range(1, len(mask_pool)):
                 pooled = cv2.bitwise_or(pooled, mask_pool[i])
 
-            normalized_motion = float(pooled.sum()) / (255.0 * LO_W * LO_H)
-
-            # Horizontal
+            # Horizontal (columns) in vertical band
             band_h = pooled[y0:y1, :]
             col = band_h.astype(np.float32).sum(axis=0)
             if col.sum() >= ENERGY_MIN_FRAC * (255.0 * (y1 - y0) * LO_W):
@@ -272,7 +285,7 @@ try:
                     dbg[0:40, 0:FRAME_W] = cv2.resize(cv2.cvtColor(np.tile(bar,(40,1)), cv2.COLOR_GRAY2BGR),(FRAME_W,40))
                     cv2.line(dbg, (int(x_norm*FRAME_W), 40), (int(x_norm*FRAME_W), 70), (255,255,255), 2)
 
-            # Vertical
+            # Vertical (rows) in horizontal band
             band_v = pooled[:, x0:x1]
             row = band_v.astype(np.float32).sum(axis=1)
             if row.sum() >= ENERGY_MIN_FRAC * (255.0 * (x1 - x0) * LO_H):
@@ -289,15 +302,38 @@ try:
                     dbg[0:FRAME_H, FRAME_W-40:FRAME_W] = barv
                     cv2.line(dbg, (FRAME_W-40, int(y_norm*FRAME_H)), (FRAME_W, int(y_norm*FRAME_H)), (255,255,255), 2)
 
-        prev_lo = lo
+            # --- Motion in the central band only (less background noise) ---
+            center_band = pooled[int(LO_H*0.20):int(LO_H*0.80), int(LO_W*0.20):int(LO_W*0.80)]
+            motion_now = float(center_band.sum()) / (255.0 * center_band.size)
 
-        # Trace windows
+            # EMA smoothing
+            if motion_ema is None:
+                motion_ema = motion_now
+            else:
+                motion_ema = MOTION_EMA_ALPHA * motion_now + (1.0 - MOTION_EMA_ALPHA) * motion_ema
+
+            # show motion bar
+            m_norm = np.clip(motion_ema / 0.02, 0.0, 1.0)  # visualize vs 2% motion
+            cv2.rectangle(dbg, (20, 50), (20 + int(200*(1.0 - m_norm)), 65), (255,255,255), -1)
+            cv2.putText(dbg, f"MOTION ema={motion_ema:.4f} thr={motion_thr_dyn:.4f}",
+                        (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
+
+        prev_lo_blur = lo_blur
+
+        # ---- Maintain swipe traces for gates/fallbacks ----
+        # (same as before)
+        # Keep short windows for LR/UD swipes
+        SPAN_WINDOW_S = 0.28
+        # Deques exist already: trace_x / trace_y
+        now_ts = now  # alias
+
+        # Compute x_norm / y_norm appended for span/vel
+        # (We already set x_norm / y_norm above)
         while trace_x and (now - trace_x[0][0]) > SPAN_WINDOW_S: trace_x.popleft()
         while trace_y and (now - trace_y[0][0]) > SPAN_WINDOW_S: trace_y.popleft()
         if x_norm is not None: trace_x.append((now, x_norm)); last_seen_t_x = now
         if y_norm is not None: trace_y.append((now, y_norm)); last_seen_t_y = now
 
-        # Spans / velocities
         span_x = vel_x = 0.0
         if len(trace_x) >= 2:
             xs = [p[1] for p in trace_x]; ts = [p[0] for p in trace_x]
@@ -307,9 +343,16 @@ try:
             ys = [p[1] for p in trace_y]; ts2 = [p[0] for p in trace_y]
             span_y = max(ys) - min(ys); dt2 = max(1e-3, ts2[-1]-ts2[0]); vel_y = (ys[-1]-ys[0])/dt2
 
-        # Swipes -> MODE (no immediate capture)
+        # ---- Swipes -> set MODE (no immediate capture) ----
         gesture_text = ""
         can_fire = (now - last_fire) > COOLDOWN_S
+
+        def set_mode_and_seed(gesture: str):
+            # seed dynamic motion threshold at arm time
+            nonlocal motion_thr_dyn
+            motion_thr_dyn = max(MOTION_THR_FLOOR, (motion_ema or MOTION_THR_FLOOR) * MOTION_THR_SCALE)
+            set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
+            cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
         # Horizontal gates
         if x_norm is not None:
@@ -319,10 +362,10 @@ try:
             if can_fire:
                 if state_x == "ARM_RIGHT" and x_norm >= R_FIRE:
                     gesture_text = "SWIPE_RIGHT"; last_fire = now; state_x = "IDLE"; trace_x.clear()
-                    print("SWIPE_RIGHT"); set_mode_from("SWIPE_RIGHT", now)
+                    print("SWIPE_RIGHT"); set_mode_and_seed("SWIPE_RIGHT")
                 elif state_x == "ARM_LEFT" and x_norm <= L_FIRE:
                     gesture_text = "SWIPE_LEFT";  last_fire = now; state_x = "IDLE"; trace_x.clear()
-                    print("SWIPE_LEFT");  set_mode_from("SWIPE_LEFT", now)
+                    print("SWIPE_LEFT");  set_mode_and_seed("SWIPE_LEFT")
         else:
             if state_x != "IDLE" and (now - last_seen_t_x) > ABSENCE_RESET_S: state_x = "IDLE"
 
@@ -334,20 +377,20 @@ try:
             if can_fire:
                 if state_y == "ARM_DOWN" and y_norm >= B_FIRE:
                     gesture_text = "SWIPE_DOWN"; last_fire = now; state_y = "IDLE"; trace_y.clear()
-                    print("SWIPE_DOWN"); set_mode_from("SWIPE_DOWN", now)
+                    print("SWIPE_DOWN"); set_mode_and_seed("SWIPE_DOWN")
                 elif state_y == "ARM_UP" and y_norm <= T_FIRE:
                     gesture_text = "SWIPE_UP";   last_fire = now; state_y = "IDLE"; trace_y.clear()
-                    print("SWIPE_UP");   set_mode_from("SWIPE_UP", now)
+                    print("SWIPE_UP");   set_mode_and_seed("SWIPE_UP")
         else:
             if state_y != "IDLE" and (now - last_seen_t_y) > ABSENCE_RESET_S: state_y = "IDLE"
 
         # Span/velocity fallback
         if can_fire and gesture_text == "" and span_x >= SPAN_THR_X and abs(vel_x) >= VEL_THR_X:
             g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
-            print(f"{g} (span/vel)"); set_mode_from(g, now); last_fire = now; state_x = "IDLE"; trace_x.clear()
+            print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
 
         # ---------------------------
-        # Armed: wait-for-stability
+        # Armed: wait-for-stability (adaptive)
         # ---------------------------
         if armed:
             if (now - arm_time) > ARM_TIMEOUT_S:
@@ -356,20 +399,22 @@ try:
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
                 stable_count = 0
             else:
-                lap = center_laplacian(bgr)
-                is_stable = (normalized_motion < MOTION_THR_FRAC) and (lap >= PRESENCE_LAPLACE_MIN)
+                lap_c = center_laplacian(bgr)
+                # "stable" if motion EMA below dynamic threshold and enough detail in center
+                is_stable = (motion_ema is not None and motion_ema < motion_thr_dyn) and (lap_c >= lap_thr_dyn)
                 stable_count = stable_count + 1 if is_stable else 0
                 if stable_count >= STABILITY_WINDOW_FR:
                     tag = current_mode or "unknown_mode"
-                    print(f"[mode] stable -> capturing ({tag})")
+                    print(f"[mode] stable -> capturing ({tag})  motion={motion_ema:.4f} thr={motion_thr_dyn:.4f} lap={lap_c:.1f} thr={lap_thr_dyn:.1f}")
                     start_capture_thread(tag)
                     armed = False
 
-            # HUD: stability bar
-            bar_w = int(np.clip(1.0 - (normalized_motion / MOTION_THR_FRAC), 0.0, 1.0) * 200)
-            cv2.rectangle(dbg, (20, 50), (20 + bar_w, 65), (255,255,255), -1)
-            cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR}  lap={int(lap)}",
-                        (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
+                # HUD for stability
+                # bar shows how close we are to motion threshold
+                closeness = 1.0 - np.clip((motion_ema or 0.0) / (motion_thr_dyn or 1e-6), 0.0, 1.0)
+                cv2.rectangle(dbg, (20, 50), (20 + int(200*closeness), 65), (255,255,255), -1)
+                cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR}  lap={int(lap_c)}>={int(lap_thr_dyn)}",
+                            (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
 
         # HUD
         cv2.line(dbg, (int(CROSS_L*FRAME_W), 0), (int(CROSS_L*FRAME_W), FRAME_H), (255,255,255), 1)
@@ -385,7 +430,7 @@ try:
             cv2.putText(dbg, gesture_text, (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
 
         if not HEADLESS:
-            cv2.imshow("Swipe -> Mode -> Stable capture", dbg)
+            cv2.imshow("Swipe -> Mode -> Stable capture (adaptive)", dbg)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
         else:
