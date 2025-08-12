@@ -19,27 +19,57 @@ def api_worker():
     if OpenAI is None or not OPENAI_API_KEY:
         print("[WARN] OpenAI library or API key missing; skipping uploads.")
         return
+    print(f"[OpenAI] Worker started. Using model: {OPENAI_MODEL}")
     client = OpenAI(api_key=OPENAI_API_KEY)
     while True:
         item = work_q.get()
         if item is None:
+            print("[OpenAI] Worker shutting down.")
             break
         tag, jpeg_bytes = item
         try:
+            print(f"[OpenAI] Preparing request for tag '{tag}', image size={len(jpeg_bytes)} bytes")
             b64 = base64.b64encode(jpeg_bytes).decode("ascii")
             msgs = [
-                {"role":"system","content":"You are an expert product identifier. Be concise and name the item if possible."},
-                {"role":"user","content":[
-                    {"type":"text","text":f"Identify the object. (mode={tag})"},
-                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
-                ]},
+                {
+                    "role": "system",
+                    "content": "You are an expert product identifier. Be concise and name the item if possible."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Identify the object. (mode={tag})"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ]
+                },
             ]
+            print(f"[OpenAI] Sending request to model {OPENAI_MODEL} for tag '{tag}'...")
             resp = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
+            print(f"[OpenAI] Response received for tag '{tag}'")
             print(f"[{tag}] Vision -> {resp.choices[0].message.content}")
         except Exception as e:
-            print(f"[{tag}] OpenAI error: {e}")
+            print(f"[OpenAI ERROR] tag='{tag}' -> {e}")
         finally:
             work_q.task_done()
+            print(f"[OpenAI] Finished processing tag '{tag}'. Queue size now: {work_q.qsize()}")
+
+def enqueue_openai(tag, rgb_frame):
+    os.makedirs("captures", exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = f"captures/{tag}_{ts}.jpg"
+    jpg = jpeg_bytes_from_rgb(rgb_frame, 92)
+    if jpg is None:
+        print(f"[{tag}] JPEG encode failed")
+        return
+    with open(path, "wb") as f:
+        f.write(jpg)
+    print(f"[enqueue] Saved {path} ({len(jpg)} bytes)")
+    try:
+        work_q.put_nowait((tag, jpg))
+        print(f"[enqueue] Added '{tag}' to queue. Current queue size: {work_q.qsize()}")
+    except queue.Full:
+        print(f"[enqueue] Queue full; skipping upload for tag '{tag}'")
+
 
 threading.Thread(target=api_worker, daemon=True).start()
 
@@ -119,18 +149,6 @@ def jpeg_bytes_from_rgb(rgb, quality=92):
     ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
                            [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     return jpg.tobytes() if ok else None
-
-def enqueue_openai(tag, rgb_frame):
-    os.makedirs("captures", exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = f"captures/{tag}_{ts}.jpg"
-    jpg = jpeg_bytes_from_rgb(rgb_frame, 92)
-    if jpg is None:
-        print(f"[{tag}] JPEG encode failed"); return
-    with open(path, "wb") as f: f.write(jpg)
-    print(f"[{tag}] saved {path}")
-    try: work_q.put_nowait((tag, jpg))
-    except queue.Full: print(f"[{tag}] queue full; skipping upload")
 
 def laplacian_sharpness(gray_u8):
     return cv2.Laplacian(gray_u8, cv2.CV_64F).var()
