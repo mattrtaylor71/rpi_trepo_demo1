@@ -28,25 +28,36 @@ def api_worker():
             break
         tag, jpeg_bytes = item
         try:
-            print(f"[OpenAI] Preparing request for tag '{tag}', image size={len(jpeg_bytes)} bytes")
-            b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-            msgs = [
-                {
-                    "role": "system",
-                    "content": "You are an expert product identifier. Be concise and name the item if possible."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Identify the object. (mode={tag})"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            # inside try: (replace the chat.completions call)
+            t0 = time.perf_counter()
+            print(f"[OpenAI] -> send responses.create (model={OPENAI_MODEL}, tag='{tag}')")
+            resp = client.responses.create(
+                model=OPENAI_MODEL,  # gpt-5 ok
+                input=[{
+                    "role":"user",
+                    "content":[
+                        {"type":"text","text":f"Identify the object. (mode={tag})"},
+                        {"type":"input_image","image_url":f"data:image/jpeg;base64,{b64}"}
                     ]
-                },
-            ]
-            print(f"[OpenAI] Sending request to model {OPENAI_MODEL} for tag '{tag}'...")
-            resp = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
-            print(f"[OpenAI] Response received for tag '{tag}'")
-            print(f"[{tag}] Vision -> {resp.choices[0].message.content}")
+                }]
+            )
+            dt = (time.perf_counter() - t0) * 1000
+            print(f"[OpenAI] <- response (tag='{tag}', {dt:.0f} ms)")
+
+            # extract text robustly
+            text = None
+            if hasattr(resp, "output_text"):
+                text = resp.output_text
+            else:
+                for out in getattr(resp, "output", []) or []:
+                    if out.get("type") == "message":
+                        for c in out.get("content", []):
+                            if c.get("type") == "text":
+                                text = c.get("text")
+                                break
+                        if text: break
+            print(f"[{tag}] Vision -> {(text or '<no text>')[:160]}")
+
         except Exception as e:
             print(f"[OpenAI ERROR] tag='{tag}' -> {e}")
         finally:
