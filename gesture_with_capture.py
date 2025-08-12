@@ -15,12 +15,35 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # or "gpt-5"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 work_q = queue.Queue(maxsize=4)
+# --------------------------
+# OpenAI API (vision) + worker
+# --------------------------
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # safer default
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+work_q = queue.Queue(maxsize=4)
+WORKER_ALIVE = False  # set True once the worker enters its loop
+
 def api_worker():
-    if OpenAI is None or not OPENAI_API_KEY:
-        print("[WARN] OpenAI library or API key missing; skipping uploads.")
+    global WORKER_ALIVE
+    if OpenAI is None:
+        print("[OpenAI] Worker not started: openai SDK not importable.")
         return
-    print(f"[OpenAI] Worker started. Using model: {OPENAI_MODEL}")
+    if not OPENAI_API_KEY:
+        print("[OpenAI] Worker not started: OPENAI_API_KEY is empty.")
+        return
+    if OPENAI_MODEL.startswith("gpt-5"):
+        print("[OpenAI][WARN] gpt-5 with chat.completions may fail. Use Responses API or gpt-4o/4o-mini.")
+
+    print(f"[OpenAI] Worker starting. model={OPENAI_MODEL}")
     client = OpenAI(api_key=OPENAI_API_KEY)
+    WORKER_ALIVE = True
+
     while True:
         item = work_q.get()
         if item is None:
@@ -28,41 +51,26 @@ def api_worker():
             break
         tag, jpeg_bytes = item
         try:
-            # inside try: (replace the chat.completions call)
+            print(f"[OpenAI] Dequeued tag='{tag}', size={len(jpeg_bytes)} bytes (qsize after dequeue={work_q.qsize()})")
+            b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            msgs = [
+                {"role":"system","content":"You are an expert product identifier. Be concise and name the item if possible."},
+                {"role":"user","content":[
+                    {"type":"text","text":f"Identify the object. (mode={tag})"},
+                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
+                ]},
+            ]
             t0 = time.perf_counter()
-            print(f"[OpenAI] -> send responses.create (model={OPENAI_MODEL}, tag='{tag}')")
-            resp = client.responses.create(
-                model=OPENAI_MODEL,  # gpt-5 ok
-                input=[{
-                    "role":"user",
-                    "content":[
-                        {"type":"text","text":f"Identify the object. (mode={tag})"},
-                        {"type":"input_image","image_url":f"data:image/jpeg;base64,{b64}"}
-                    ]
-                }]
-            )
-            dt = (time.perf_counter() - t0) * 1000
-            print(f"[OpenAI] <- response (tag='{tag}', {dt:.0f} ms)")
-
-            # extract text robustly
-            text = None
-            if hasattr(resp, "output_text"):
-                text = resp.output_text
-            else:
-                for out in getattr(resp, "output", []) or []:
-                    if out.get("type") == "message":
-                        for c in out.get("content", []):
-                            if c.get("type") == "text":
-                                text = c.get("text")
-                                break
-                        if text: break
-            print(f"[{tag}] Vision -> {(text or '<no text>')[:160]}")
-
+            print(f"[OpenAI] -> chat.completions.create (model={OPENAI_MODEL}, tag='{tag}')")
+            resp = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
+            dt_ms = (time.perf_counter() - t0) * 1000
+            print(f"[OpenAI] <- response (tag='{tag}', {dt_ms:.0f} ms)")
+            text = (resp.choices[0].message.content or "").strip()
+            print(f"[{tag}] Vision -> {text if text else '<empty content>'}")
         except Exception as e:
-            print(f"[OpenAI ERROR] tag='{tag}' -> {e}")
+            print(f"[OpenAI ERROR] tag='{tag}': {type(e).__name__}: {e}")
         finally:
             work_q.task_done()
-            print(f"[OpenAI] Finished processing tag '{tag}'. Queue size now: {work_q.qsize()}")
 
 def enqueue_openai(tag, rgb_frame):
     os.makedirs("captures", exist_ok=True)
@@ -70,19 +78,31 @@ def enqueue_openai(tag, rgb_frame):
     path = f"captures/{tag}_{ts}.jpg"
     jpg = jpeg_bytes_from_rgb(rgb_frame, 92)
     if jpg is None:
-        print(f"[{tag}] JPEG encode failed")
+        print(f"[enqueue] {tag}: JPEG encode failed")
         return
     with open(path, "wb") as f:
         f.write(jpg)
-    print(f"[enqueue] Saved {path} ({len(jpg)} bytes)")
+    print(f"[enqueue] {tag}: saved {path} ({len(jpg)} bytes)")
+    if not WORKER_ALIVE:
+        # Don’t silently enqueue if nobody’s consuming
+        print("[enqueue][WARN] OpenAI worker not running. Check OPENAI_API_KEY and import. Skipping enqueue.")
+        return
     try:
         work_q.put_nowait((tag, jpg))
-        print(f"[enqueue] Added '{tag}' to queue. Current queue size: {work_q.qsize()}")
+        print(f"[enqueue] {tag}: enqueued. qsize={work_q.qsize()}")
     except queue.Full:
-        print(f"[enqueue] Queue full; skipping upload for tag '{tag}'")
+        print(f"[enqueue] {tag}: queue full, skipped")
 
-
+# spin up worker (do this once after defs)
 threading.Thread(target=api_worker, daemon=True).start()
+
+# Optional: tiny watchdog to show queue health every ~5s
+def q_watchdog():
+    while True:
+        time.sleep(5)
+        print(f"[q-watch] alive={WORKER_ALIVE} qsize={work_q.qsize()}")
+threading.Thread(target=q_watchdog, daemon=True).start()
+
 
 # =========================
 # Swipe detector config
