@@ -245,7 +245,13 @@ class EpaperUI:
 
     def _draw_mode(self, mode, frac):
         img, d = self._new_layer()
-        title = {"discard":"Discard","check_in":"Check-in","opened":"Opened","other":"Other"}.get(mode, mode or "--")
+        title = {
+            "discard": "Discard",
+            "check_in": "Check-in",
+            "opened": "Opened",
+            "other": "Other",
+            "expiry": "Checking expiry...",
+        }.get(mode, mode or "--")
         self._centered_text(d, 6, title, self.font_big)
         line1 = "hold items"
         line2 = "1–2ft away from camera"
@@ -326,10 +332,16 @@ def api_worker():
         tag, jpeg_bytes = item
         try:
             b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            if tag == "expiry":
+                user_text = "This is a food item. The expiration date is shown. Extract the expiration or best-by date."
+                system_text = "You read expiration dates from product photos. Respond with the date only."
+            else:
+                user_text = f"Identify the object. (mode={tag})"
+                system_text = "You are an expert product identifier. Be concise."
             msgs = [
-                {"role":"system","content":"You are an expert product identifier. Be concise."},
+                {"role":"system","content":system_text},
                 {"role":"user","content":[
-                    {"type":"text","text":f"Identify the object. (mode={tag})"},
+                    {"type":"text","text":user_text},
                     {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
                 ]},
             ]
@@ -407,6 +419,7 @@ HEADLESS = os.environ.get("DISPLAY", "") == ""
 CAPTURE_COOLDOWN_S = 2.5
 last_capture_t = 0.0
 countdown_last_sec = -1
+EXPIRY_WAIT_S = 5.0
 
 # Stability / thresholds
 WAIT_AFTER_SWIPE_S   = 1.0
@@ -543,6 +556,8 @@ current_mode = None
 armed = False
 arm_time = 0.0
 stable_count = 0
+awaiting_expiry = False
+expiry_prompt_time = 0.0
 
 motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
@@ -556,14 +571,16 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
     global need_clear, stable_since, confirm_left, presence_dwell_start
-    global countdown_last_sec
+    global countdown_last_sec, awaiting_expiry, expiry_prompt_time
 
     m = MODE_MAP.get(gesture)
     if not m: return
     current_mode = m
     armed = True
     need_clear = False
+    awaiting_expiry = False
     arm_time = now_ts
+    expiry_prompt_time = 0.0
     countdown_last_sec = -1
     stable_count = 0
     stable_since = None
@@ -712,16 +729,31 @@ try:
         # Armed: wait-for-stability
         # ---------------------------
         if armed:
-            remaining = max(0.0, ARM_TIMEOUT_S - (now - arm_time))
+            total = EXPIRY_WAIT_S if awaiting_expiry else ARM_TIMEOUT_S
+            remaining = max(0.0, total - (now - arm_time))
             if (now - last_capture_t) < CAPTURE_COOLDOWN_S:
                 stable_count = 0
                 presence_dwell_start = None
-            elif (now - arm_time) > ARM_TIMEOUT_S:
-                print("[mode] timeout; disarming without capture")
-                EPD_UI.show_timeout()
-                armed = False
-                presence_dwell_start = None
-                countdown_last_sec = -1
+            elif (now - arm_time) > total:
+                if awaiting_expiry:
+                    print("[expiry] timeout; awaiting item removal")
+                    awaiting_expiry = False
+                    need_clear = True
+                    armed = False
+                    clear_count = 0
+                    last_capture_t = now
+                    stable_count = 0
+                    stable_since = None
+                    confirm_left = 0
+                    presence_dwell_start = None
+                    countdown_last_sec = -1
+                    EPD_UI.show_captured("expiry", "NO EXPIRY", 1.0)
+                else:
+                    print("[mode] timeout; disarming without capture")
+                    EPD_UI.show_timeout()
+                    armed = False
+                    presence_dwell_start = None
+                    countdown_last_sec = -1
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
                 stable_count = 0
                 presence_dwell_start = None
@@ -731,7 +763,8 @@ try:
                     sec = int(remaining)
                     if sec != countdown_last_sec:
                         countdown_last_sec = sec
-                        EPD_UI.show_mode_prompt(current_mode, remaining / ARM_TIMEOUT_S)
+                        display_mode = "expiry" if awaiting_expiry else current_mode
+                        EPD_UI.show_mode_prompt(display_mode, remaining / total)
 
                 lap_c = center_laplacian(bgr)
                 thr_enter = motion_thr_dyn * ENTER_RELAX
@@ -776,23 +809,44 @@ try:
                             else:
                                 confirm_left -= 1
                                 if confirm_left == 0:
-                                    tag = current_mode or "unknown_mode"
+                                    tag = "expiry" if awaiting_expiry else (current_mode or "unknown_mode")
                                     print(f"[mode] stable -> capturing ({tag})  mo={motion_ema:.4f}/{motion_thr_dyn:.4f} lap={lap_c:.1f}/{lap_thr_dyn+LAPLACE_MARGIN:.1f}")
                                     start_capture_thread(tag)
-                                    msg = "\u2713 CHECKED IN!" if tag == "check_in" else "\u2717 DISCARDED!"
+                                    if tag == "check_in":
+                                        msg = "\u2713 CHECKED IN!"
+                                    elif tag == "expiry":
+                                        msg = "EXPIRY SAVED"
+                                    else:
+                                        msg = "\u2717 DISCARDED!"
                                     EPD_UI.show_captured(tag, msg, 1.0)
                                     last_capture_t = now
                                     arm_time = now
                                     stable_count = 0
                                     stable_since = None
                                     presence_dwell_start = None
-                                    need_clear = True
-                                    armed = False
-                                    clear_count = 0
-                                    print("[mode] captured; waiting for item removal to re-arm")
+                                    if awaiting_expiry:
+                                        awaiting_expiry = False
+                                        need_clear = True
+                                        armed = False
+                                        clear_count = 0
+                                        print("[expiry] captured; waiting for item removal")
+                                    elif tag == "check_in":
+                                        awaiting_expiry = True
+                                        expiry_prompt_time = now
+                                        armed = True
+                                        need_clear = False
+                                        clear_count = 0
+                                        countdown_last_sec = -1
+                                        EPD_UI.show_mode_prompt("expiry", 1.0)
+                                        print("[expiry] checking for expiration date")
+                                    else:
+                                        need_clear = True
+                                        armed = False
+                                        clear_count = 0
+                                        print("[mode] captured; waiting for item removal to re-arm")
 
         # Re-arm when item is removed (center detail low for a few frames + min time)
-        if need_clear:
+        if need_clear or awaiting_expiry:
             lap_c = center_laplacian(bgr)
             clear_thr = max(PRESENCE_LAPLACE_MIN * 0.8, lap_thr_dyn * CLEAR_LAPLACE_FRAC)
             if lap_c < clear_thr:
@@ -802,14 +856,25 @@ try:
 
             ready_by_time = (now - last_capture_t) >= MIN_CLEAR_S
             if ready_by_time and clear_count >= CLEAR_WINDOW_FR:
-                need_clear = False
-                armed = True
-                arm_time = now
-                countdown_last_sec = -1
-                presence_dwell_start = None
-                print("[mode] scene cleared; re-armed")
-                if current_mode:
-                    EPD_UI.show_mode_prompt(current_mode, 1.0)
+                if awaiting_expiry:
+                    awaiting_expiry = False
+                    armed = True
+                    arm_time = now
+                    countdown_last_sec = -1
+                    presence_dwell_start = None
+                    clear_count = 0
+                    print("[expiry] item removed; re-armed")
+                    if current_mode:
+                        EPD_UI.show_mode_prompt(current_mode, 1.0)
+                else:
+                    need_clear = False
+                    armed = True
+                    arm_time = now
+                    countdown_last_sec = -1
+                    presence_dwell_start = None
+                    print("[mode] scene cleared; re-armed")
+                    if current_mode:
+                        EPD_UI.show_mode_prompt(current_mode, 1.0)
 
             cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
