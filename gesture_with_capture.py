@@ -274,8 +274,6 @@ class EpaperUI:
         tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
         x = (self.W - tw)//2; y = (self.H - th)//2
 
-        pad = 6
-        d.rectangle((x - pad, y - pad, x + tw + pad, y + th + pad), outline=0, fill=255)
         d.text((x, y), banner, font=self.font_big, fill=0)
 
         # countdown bar
