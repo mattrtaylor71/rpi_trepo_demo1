@@ -53,6 +53,17 @@ class EpaperUI:
     def show_inventory(self, item, frac=1.0):
         self._post(("inventory", (item, frac)))
 
+    def clear_queue(self):
+        if not self.enabled:
+            return
+        try:
+            while True:
+                self.q.get_nowait()
+                self.q.task_done()
+        except Exception:
+            pass
+        self.last_screen = None
+
     # Internals
     def _post(self, msg):
         if not self.enabled: return
@@ -244,17 +255,33 @@ class EpaperUI:
         mid_x = self.W // 2
         mid_y = self.H // 2
 
-        # Left arrow + label
-        x = 10 + s
-        self._arrow(d, x=x, y=mid_y, size=s, direction="left")
-        d.text((x + s + 4, mid_y - 7), "Discard", font=self.font_sm, fill=0)
+        # Left/right arrows near center but outside text
+        text_left = (self.W - tw) // 2
+        text_right = text_left + tw
+        gap = 10
+        left_x = text_left - s - gap
+        right_x = text_right + s + gap
+        self._arrow(d, x=left_x, y=mid_y, size=s, direction="left")
+        self._arrow(d, x=right_x, y=mid_y, size=s, direction="right")
 
-        # Right arrow + label
-        x = self.W - 10 - s
-        self._arrow(d, x=x, y=mid_y, size=s, direction="right")
-        bbox = d.textbbox((0, 0), "Check-in", font=self.font_sm)
-        tw = bbox[2] - bbox[0]
-        d.text((x - s - 4 - tw, mid_y - 7), "Check-in", font=self.font_sm, fill=0)
+        # Vertical labels on edges
+        label = "Discard"
+        bbox = d.textbbox((0, 0), label, font=self.font_sm)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        timg = _Image.new('1', (tw, th), 255)
+        td = _Draw.Draw(timg)
+        td.text((0, 0), label, font=self.font_sm, fill=0)
+        timg = timg.rotate(90, expand=True)
+        img.paste(timg, (0, (self.H - timg.height) // 2))
+
+        label = "Check-in"
+        bbox = d.textbbox((0, 0), label, font=self.font_sm)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        timg = _Image.new('1', (tw, th), 255)
+        td = _Draw.Draw(timg)
+        td.text((0, 0), label, font=self.font_sm, fill=0)
+        timg = timg.rotate(270, expand=True)
+        img.paste(timg, (self.W - timg.width, (self.H - timg.height) // 2))
 
         # Up arrow + label
         y = 10 + s
@@ -355,6 +382,12 @@ class EpaperUI:
             y += 16
             opened = item.get('opened_date') or "--"
             d.text((2, y), f"opened: {opened}", font=self.font_sm, fill=0)
+
+        # Scroll arrows
+        mid_y = self.H // 2
+        s = 8
+        self._arrow(d, x=3 + s, y=mid_y, size=s, direction="left")
+        self._arrow(d, x=self.W - 3 - s, y=mid_y, size=s, direction="right")
 
         bar_h = 8
         bar_y0 = self.H - bar_h - 4
@@ -875,11 +908,14 @@ try:
                 if gesture == "SWIPE_LEFT":
                     if inventory_rows:
                         inventory_idx = (inventory_idx + 1) % len(inventory_rows)
+                        EPD_UI.clear_queue()
                 elif gesture == "SWIPE_RIGHT":
                     if inventory_rows:
                         inventory_idx = (inventory_idx - 1) % len(inventory_rows)
+                        EPD_UI.clear_queue()
                 else:
                     inventory_mode = False
+                    EPD_UI.clear_queue()
                     EPD_UI.show_main()
                     return
                 item = inventory_rows[inventory_idx] if inventory_rows else None
@@ -892,6 +928,7 @@ try:
                     inventory_last_gesture = now
                     inventory_mode = True
                     item = inventory_rows[inventory_idx] if inventory_rows else None
+                    EPD_UI.clear_queue()
                     EPD_UI.show_inventory(item, 1.0)
                     inventory_last_draw = now
                     return
@@ -941,6 +978,7 @@ try:
             frac = remaining / INVENTORY_TIMEOUT_S
             if remaining <= 0:
                 inventory_mode = False
+                EPD_UI.clear_queue()
                 EPD_UI.show_main()
             elif (now - inventory_last_draw) > 0.5:
                 inventory_last_draw = now
@@ -1047,6 +1085,8 @@ try:
                                         msg = "\u2713 CHECKED IN!"
                                     elif tag == "expiry":
                                         msg = "EXPIRY SAVED"
+                                    elif tag == "opened":
+                                        msg = "\u2713 OPENED!"
                                     else:
                                         msg = "\u2717 DISCARDED!"
                                     EPD_UI.show_captured(tag, msg, 1.0)
