@@ -538,7 +538,6 @@ def capture_high_quality(tag: str):
                 scores.append(laplacian_sharpness(gray))
                 time.sleep(0.05)
             best = frames[int(np.argmax(scores))]
-            best = cv2.rotate(best, cv2.ROTATE_90_COUNTERCLOCKWISE)
             print(f"[{tag}] sharpness: {[round(s,1) for s in scores]}")
             enqueue_openai(tag, best)
         except Exception as e:
@@ -628,9 +627,7 @@ try:
             time.sleep(0.005); continue
         try:
             lo  = y_plane(picam2.capture_array("lores"))
-            lo  = cv2.rotate(lo, cv2.ROTATE_90_COUNTERCLOCKWISE)
             rgb = picam2.capture_array("main")
-            rgb = cv2.rotate(rgb, cv2.ROTATE_90_COUNTERCLOCKWISE)
         finally:
             cam_lock.release()
 
