@@ -50,6 +50,8 @@ class EpaperUI:
     def show_timeout(self):
         self.cur_mode = None
         self._post(("timeout", None))
+    def show_inventory(self, rows):
+        self._post(("inventory", rows))
 
     # Internals
     def _post(self, msg):
@@ -142,6 +144,7 @@ class EpaperUI:
                     self._draw_captured(m, ok, frac)
                 elif kind == "expiry":       self._draw_expiry()
                 elif kind == "timeout":       self._draw_main()
+                elif kind == "inventory":     self._draw_inventory(payload)
             except Exception as e:
                 print(f"[EPD] worker error: {e}")
             finally:
@@ -233,7 +236,9 @@ class EpaperUI:
     def _draw_main(self):
         img, d = self._new_layer()
         self._centered_text(d, 6, "Swipe to choose mode", self.font_md)
-        y = int(self.H * 0.60); s = 20
+        s = 20
+        mid_x = self.W // 2
+        y = int(self.H * 0.60)
         left_x = int(self.W * 0.30)
         right_x = int(self.W * 0.70)
         self._arrow(d, x=left_x, y=y, size=s, direction="left")
@@ -244,6 +249,16 @@ class EpaperUI:
         bbox = d.textbbox((0, 0), "Check-in", font=self.font_sm)
         tw = bbox[2] - bbox[0]
         d.text((right_x - tw // 2, y + 18), "Check-in", font=self.font_sm, fill=0)
+        up_y = int(self.H * 0.25)
+        self._arrow(d, x=mid_x, y=up_y, size=s, direction="up")
+        bbox = d.textbbox((0, 0), "Inventory", font=self.font_sm)
+        tw = bbox[2] - bbox[0]
+        d.text((mid_x - tw // 2, up_y - s - 10), "Inventory", font=self.font_sm, fill=0)
+        down_y = int(self.H * 0.85)
+        self._arrow(d, x=mid_x, y=down_y, size=s, direction="down")
+        bbox = d.textbbox((0, 0), "Opened", font=self.font_sm)
+        tw = bbox[2] - bbox[0]
+        d.text((mid_x - tw // 2, down_y + s + 2), "Opened", font=self.font_sm, fill=0)
         self._push_partial(img)
 
     def _draw_mode(self, mode, frac):
@@ -252,7 +267,6 @@ class EpaperUI:
             "discard": "Discard",
             "check_in": "Check-in",
             "opened": "Opened",
-            "other": "Other",
             "expiry": "Checking expiry...",
         }.get(mode, mode or "--")
         self._centered_text(d, 6, title, self.font_big)
@@ -298,6 +312,21 @@ class EpaperUI:
         self._centered_text(d, 6, "Log expiration date?", self.font_md)
         self._push_partial(img)
 
+    def _draw_inventory(self, rows):
+        img, d = self._new_layer()
+        if not rows:
+            self._centered_text(d, 6, "Inventory empty", self.font_md)
+        else:
+            y = 6
+            line_h = 16
+            for r in rows:
+                text = f"{r['name']} - {r['expiry']} ({r['state']})"
+                d.text((2, y), text, font=self.font_sm, fill=0)
+                y += line_h
+                if y > self.H - line_h:
+                    break
+        self._push_partial(img)
+
     def _arrow(self, draw, x, y, size=24, direction="left"):
         s = size
         if direction == "left":
@@ -306,6 +335,12 @@ class EpaperUI:
         elif direction == "right":
             draw.polygon([(x+s, y), (x, y-s), (x, y+s)], outline=0, fill=0)
             draw.rectangle((x-s, y-4, x, y+4), outline=0, fill=0)
+        elif direction == "up":
+            draw.polygon([(x, y-s), (x-s, y), (x+s, y)], outline=0, fill=0)
+            draw.rectangle((x-4, y, x+4, y+s), outline=0, fill=0)
+        elif direction == "down":
+            draw.polygon([(x, y+s), (x-s, y), (x+s, y)], outline=0, fill=0)
+            draw.rectangle((x-4, y-s, x+4, y), outline=0, fill=0)
 
 # Singleton UI
 EPD_UI = EpaperUI()
@@ -330,27 +365,31 @@ def load_inventory():
     if not os.path.exists(CSV_PATH):
         return []
     with open(CSV_PATH, newline="") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r.setdefault("state", "sealed")
+        r.setdefault("opened_date", "")
+    return rows
 
 def save_inventory(rows):
     with open(CSV_PATH, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "expiry"])
+        writer = csv.DictWriter(f, fieldnames=["name", "expiry", "state", "opened_date"])
         writer.writeheader()
         writer.writerows(rows)
 
 def add_inventory_item(name, expiry):
     with inventory_lock:
         rows = load_inventory()
-        rows.append({"name": name, "expiry": expiry})
+        rows.append({"name": name, "expiry": expiry, "state": "sealed", "opened_date": ""})
         save_inventory(rows)
 
-def match_discarded_item(discard_name, inventory_names, client):
+def match_inventory_item(query_name, inventory_names, client):
     if not inventory_names:
         return "NONE"
     items = "\n".join(f"- {n}" for n in inventory_names)
     msgs = [
-        {"role": "system", "content": "Match the discarded item to one inventory item. Reply with the exact item or NONE."},
-        {"role": "user", "content": f"Discarded item: {discard_name}\nInventory items:\n{items}"},
+        {"role": "system", "content": "Match the query item to one inventory item. Reply with the exact item or NONE."},
+        {"role": "user", "content": f"Query item: {query_name}\nInventory items:\n{items}"},
     ]
     resp = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
     return (resp.choices[0].message.content or "").strip()
@@ -358,7 +397,7 @@ def match_discarded_item(discard_name, inventory_names, client):
 def remove_inventory_item(discard_name, client):
     rows = load_inventory()
     names = [r["name"] for r in rows]
-    match = match_discarded_item(discard_name, names, client)
+    match = match_inventory_item(discard_name, names, client)
     if match in names:
         idx = names.index(match)
         removed = rows.pop(idx)
@@ -367,6 +406,20 @@ def remove_inventory_item(discard_name, client):
         print(f"[inventory] removed {removed['name']} exp {removed['expiry']}")
     else:
         print(f"[inventory] no match for '{discard_name}' (model -> {match})")
+
+def mark_inventory_opened(opened_name, client):
+    rows = load_inventory()
+    names = [r["name"] for r in rows]
+    match = match_inventory_item(opened_name, names, client)
+    if match in names:
+        idx = names.index(match)
+        rows[idx]["state"] = "opened"
+        rows[idx]["opened_date"] = datetime.date.today().isoformat()
+        with inventory_lock:
+            save_inventory(rows)
+        print(f"[inventory] opened {rows[idx]['name']}")
+    else:
+        print(f"[inventory] no match for '{opened_name}' (model -> {match})")
 
 def handle_openai_result(tag, text, client):
     global pending_item_name
@@ -382,6 +435,8 @@ def handle_openai_result(tag, text, client):
             print(f"[inventory] no pending item for expiry '{text}'")
     elif tag == "discard":
         remove_inventory_item(text, client)
+    elif tag == "opened":
+        mark_inventory_opened(text, client)
 
 def api_worker():
     global WORKER_ALIVE
@@ -633,8 +688,7 @@ x0, x1 = int(ROI_X0 * LO_W), int(ROI_X1 * LO_W)
 MODE_MAP = {
     "SWIPE_RIGHT": "check_in",
     "SWIPE_LEFT":  "discard",
-    "SWIPE_UP":    "opened",
-    "SWIPE_DOWN":  "other",
+    "SWIPE_DOWN":  "opened",
 }
 current_mode = None
 armed = False
@@ -771,6 +825,9 @@ try:
 
         def set_mode_and_seed(gesture: str):
             global motion_thr_dyn
+            if gesture == "SWIPE_UP":
+                EPD_UI.show_inventory(load_inventory())
+                return
             ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
             motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))
             set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
