@@ -565,6 +565,8 @@ armed = False
 arm_time = 0.0
 stable_count = 0
 awaiting_expiry = False
+expiry_prompt_time = 0.0
+
 
 motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
@@ -578,7 +580,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
     global need_clear, stable_since, confirm_left, presence_dwell_start
-    global countdown_last_sec, awaiting_expiry
+    global countdown_last_sec, awaiting_expiry, expiry_prompt_time
 
     m = MODE_MAP.get(gesture)
     if not m: return
@@ -587,6 +589,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     need_clear = False
     awaiting_expiry = False
     arm_time = now_ts
+    expiry_prompt_time = 0.0
     countdown_last_sec = -1
     stable_count = 0
     stable_since = None
@@ -846,6 +849,7 @@ try:
                                         print("[expiry] captured; waiting for item removal")
                                     elif tag == "check_in":
                                         awaiting_expiry = True
+                                        expiry_prompt_time = now
                                         armed = True
                                         need_clear = False
                                         clear_count = 0
