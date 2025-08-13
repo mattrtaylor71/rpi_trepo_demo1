@@ -45,6 +45,8 @@ class EpaperUI:
     def show_captured(self, m, t, frac=1.0):
         self.cur_mode = m
         self._post(("captured", (m, t, frac)))
+    def show_expiry_prompt(self):
+        self._post(("expiry", None))
     def show_timeout(self):
         self.cur_mode = None
         self._post(("timeout", None))
@@ -138,6 +140,7 @@ class EpaperUI:
                 elif kind == "captured":
                     m, ok, frac = payload
                     self._draw_captured(m, ok, frac)
+                elif kind == "expiry":       self._draw_expiry()
                 elif kind == "timeout":       self._draw_main()
             except Exception as e:
                 print(f"[EPD] worker error: {e}")
@@ -288,6 +291,11 @@ class EpaperUI:
         d.rectangle((0, bar_y0, self.W, bar_y0 + bar_h), outline=0, fill=255)
         d.rectangle((0, bar_y0, int(self.W * max(0.0, min(1.0, frac))), bar_y0 + bar_h), outline=0, fill=0)
 
+        self._push_partial(img)
+
+    def _draw_expiry(self):
+        img, d = self._new_layer()
+        self._centered_text(d, 6, "Log expiration date?", self.font_md)
         self._push_partial(img)
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
@@ -724,6 +732,14 @@ try:
         if can_fire and gesture_text == "" and span_x >= SPAN_THR_X and abs(vel_x) >= VEL_THR_X:
             g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
             print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
+
+        # Expiration prompt timeout
+        if awaiting_expiry and (now - expiry_prompt_time) > EXPIRY_WAIT_S:
+            awaiting_expiry = False
+            need_clear = True
+            armed = False
+            clear_count = 0
+            print("[expiry] timeout; awaiting item removal")
 
         # ---------------------------
         # Armed: wait-for-stability
