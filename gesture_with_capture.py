@@ -808,6 +808,9 @@ try:
         if can_fire and gesture_text == "" and span_x >= SPAN_THR_X and abs(vel_x) >= VEL_THR_X:
             g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
             print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
+        if can_fire and gesture_text == "" and span_y >= SPAN_THR_Y and abs(vel_y) >= VEL_THR_Y:
+            g = "SWIPE_DOWN" if vel_y > 0 else "SWIPE_UP"
+            print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_y = "IDLE"; trace_y.clear()
 
         # Expiration prompt timeout
         if awaiting_expiry and (now - expiry_prompt_time) > EXPIRY_WAIT_S:
