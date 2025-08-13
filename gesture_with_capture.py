@@ -4,13 +4,18 @@ import cv2
 from picamera2 import Picamera2
 
 
+import time, os, collections, threading, queue, base64, datetime
+import numpy as np
+import cv2
+from picamera2 import Picamera2
+
 # ─────────────────────────────────────────────────────────────────────────────
-# EPAPER UI (2.13" mono B/W V4) — full refresh ONLY for “main”; partial elsewhere
+# EPAPER UI (2.13" mono B/W V4) — PARTIAL-ONLY AFTER BOOT (no flashing)
 # ─────────────────────────────────────────────────────────────────────────────
 import threading as _thr
 from queue import Queue as _Q
 try:
-    # ✅ Use the mono driver (not the tri-color one)
+    # ✅ Must use the mono driver, not tri-color
     from waveshare_epd import epd2in13_V4 as _EPD
     from PIL import Image as _Image, ImageDraw as _Draw, ImageFont as _Font
 except Exception:
@@ -19,11 +24,15 @@ except Exception:
 
 class EpaperUI:
     """
-    Mono 2.13" V4:
-      - Full refresh ONLY for main screen (and on first boot).
-      - Mode / Captured screens use PART_UPDATE via displayPartial() (no big flash).
-      - No Clear() after boot. No unnecessary re-inits (we track LUT mode).
+    Strategy:
+      • Boot: FULL init + Clear (one unavoidable flash) → immediately switch to PART_UPDATE,
+        set a white base image via displayPartBaseImage(...).
+      • After that: NEVER switch back to FULL. ALL screens (main/mode/captured) use displayPartial(...).
+      • Optional: you can do a scheduled hard refresh to clean ghosting, but default is off.
     """
+
+    # Set to >0 (seconds) if you want an occasional hard refresh to scrub ghosting
+    HARD_REFRESH_PERIOD_S = 0  # e.g., 300 for every 5 minutes; 0 disables
 
     def __init__(self):
         self.enabled = (_EPD is not None and _Image is not None)
@@ -35,30 +44,29 @@ class EpaperUI:
         self.last_screen = None
 
         # runtime
-        self._lut = None             # 'full' | 'partial' | None
-        self.prev = None             # last pushed PIL image (mono)
+        self.prev = None             # last pushed PIL (1-bit) image (post-rotation)
         self.rotate_deg = 0
         self.rotate_180 = False
+        self._last_hard = 0.0
 
         if self.enabled:
             self._worker = _thr.Thread(target=self._run, daemon=True)
             self._worker.start()
 
-    # ── Public (non-blocking) ────────────────────────────────────────────────
+    # Public, non-blocking
     def show_main(self):            self._post(("main", None))
     def show_mode_prompt(self, m):  self.cur_mode = m; self._post(("mode", m))
     def show_captured(self, m, t):  self.cur_mode = m; self._post(("captured", (m, t)))
     def show_timeout(self):         self.cur_mode = None; self._post(("timeout", None))
 
-    # ── Internals ────────────────────────────────────────────────────────────
+    # Internals
     def _post(self, msg):
         if not self.enabled: return
-        if msg == self.last_screen: return  # coalesce duplicates
+        if msg == self.last_screen: return
         try:
             self.q.put_nowait(msg)
             self.last_screen = msg
-        except:
-            pass
+        except: pass
 
     def _safe_init(self):
         if self.epd is not None:
@@ -66,20 +74,18 @@ class EpaperUI:
         try:
             self.epd = _EPD.EPD()
 
-            # FULL once at boot
+            # 1) FULL init once + clear (boot flash)
             if hasattr(self.epd, "FULL_UPDATE"):
                 self.epd.init(self.epd.FULL_UPDATE)
             else:
                 self.epd.init()
-            # Clear ONLY here (use white)
             try:
                 self.epd.Clear(0xFF)
             except Exception:
                 pass
-            self._lut = 'full'
 
             # geometry
-            self.baseW, self.baseH = self.epd.width, self.epd.height
+            self.baseW, self.baseH = getattr(self.epd, "width", 0), getattr(self.epd, "height", 0)
             if self.baseH > self.baseW:
                 self.W, self.H = self.baseH, self.baseW
                 self.rotate_deg = 90
@@ -88,7 +94,7 @@ class EpaperUI:
                 self.rotate_deg = 0
             self.rotate_180 = False
 
-            # Fonts
+            # fonts
             base = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             font1 = os.path.join(base, "font", "Font.ttc")
             if os.path.exists(font1):
@@ -100,6 +106,18 @@ class EpaperUI:
                 self.font_big = _Font.truetype(f, 26)
                 self.font_md  = _Font.truetype(f, 18)
                 self.font_sm  = _Font.truetype(f, 14)
+
+            # 2) Immediately enter PARTIAL and set a white base image
+            self._enter_partial_mode()
+            white = _Image.new('1', (self.W, self.H), 255)
+            white = self._rotate(white)
+            try:
+                self.epd.displayPartBaseImage(self._buf(white))
+            except Exception:
+                # Some forks don’t expose this; partial will still work but may ghost a bit more
+                self.epd.displayPartial(self._buf(white))
+            self.prev = white
+            self._last_hard = time.time()
 
         except Exception as e:
             print(f"[EPD] init failed: {e}")
@@ -113,21 +131,25 @@ class EpaperUI:
                 if not self.enabled:
                     continue
 
+                # Optional scheduled hard refresh (disabled by default)
+                if self.HARD_REFRESH_PERIOD_S > 0 and (time.time() - self._last_hard) >= self.HARD_REFRESH_PERIOD_S:
+                    self._hard_refresh()
+
                 kind, payload = msg
-                if kind == "main":            self._draw_main()       # FULL
+                if kind == "main":            self._draw_main()        # PARTIAL (no flash)
                 elif kind == "mode":          self._draw_mode(payload) # PARTIAL
                 elif kind == "captured":
                     m, ok = payload
-                    self._draw_captured(m, ok)                        # PARTIAL
-                elif kind == "timeout":       self._draw_main()       # FULL
+                    self._draw_captured(m, ok)                         # PARTIAL
+                elif kind == "timeout":       self._draw_main()        # PARTIAL
             except Exception as e:
                 print(f"[EPD] worker error: {e}")
             finally:
                 self.q.task_done()
 
-    # ── Low-level helpers ───────────────────────────────────────────────────
+    # Low-level helpers
     def _new_layer(self):
-        img = _Image.new('1', (self.W, self.H), 255)     # 1-bit white
+        img = _Image.new('1', (self.W, self.H), 255)
         d   = _Draw.Draw(img)
         return img, d
 
@@ -140,96 +162,88 @@ class EpaperUI:
             img = img.rotate(180)
         return img
 
-    def _enter_full(self):
-        if self._lut == 'full': return
+    def _buf(self, img):
+        return self.epd.getbuffer(img)
+
+    def _enter_partial_mode(self):
+        # Stick the controller in PART_UPDATE and never leave it
         try:
+            if hasattr(self.epd, "PART_UPDATE"):
+                self.epd.init(self.epd.PART_UPDATE)
+            elif hasattr(self.epd, "init_fast"):
+                self.epd.init_fast()
+            else:
+                # Some forks use Init_Partial/init_Partial
+                if   hasattr(self.epd, "Init_Partial"):  self.epd.Init_Partial()
+                elif hasattr(self.epd, "init_Partial"):  self.epd.init_Partial()
+                else:                                     self.epd.init()
+        except Exception as e:
+            print(f"[EPD] enter PART_UPDATE failed: {e}")
+
+    def _push_partial(self, img):
+        out = self._rotate(img)
+        # Drop identical frames
+        if self.prev is not None:
+            try:
+                if out.tobytes() == self.prev.tobytes():
+                    return
+            except Exception:
+                pass
+        try:
+            if hasattr(self.epd, "displayPartial"):
+                self.epd.displayPartial(self._buf(out))
+            elif hasattr(self.epd, "display_Partial"):
+                self.epd.display_Partial(self._buf(out))
+            else:
+                # Fallback: still in partial LUT, so this won’t hard-flash
+                self.epd.display(self._buf(out))
+        except Exception as e:
+            print(f"[EPD] partial draw failed: {e}")
+        self.prev = out
+
+    def _hard_refresh(self):
+        """Optional: scrub ghosting with a full cycle, then re-prime partial base."""
+        try:
+            # FULL
             if hasattr(self.epd, "FULL_UPDATE"):
                 self.epd.init(self.epd.FULL_UPDATE)
             else:
                 self.epd.init()
-            self._lut = 'full'
-        except Exception as e:
-            print(f"[EPD] enter_full failed: {e}")
-
-    def _enter_partial(self):
-        if self._lut == 'partial': return
-        try:
-            if hasattr(self.epd, "PART_UPDATE"):
-                self.epd.init(self.epd.PART_UPDATE)
-            else:
-                # Some forks expose init_fast(); fall back if present
-                if hasattr(self.epd, "init_fast"):
-                    self.epd.init_fast()
-                else:
-                    self.epd.init()
-            self._lut = 'partial'
-        except Exception as e:
-            print(f"[EPD] enter_partial failed: {e}")
-
-    def _buf(self, img):
-        # Waveshare expects a packed buffer from a PIL 1-bit image.
-        return self.epd.getbuffer(img)
-
-    # IMPORTANT: Full refresh ONLY here. Also primes partial base image.
-    def _push_full_then_prime_partial(self, img):
-        self._enter_full()
-        out = self._rotate(img)
-
-        # Full-screen draw (this is where the flash happens)
-        self.epd.display(self._buf(out))
-
-        # Immediately switch to partial mode and set base image
-        self._enter_partial()
-        try:
-            # Required on mono V4 to enable clean partials
-            self.epd.displayPartBaseImage(self._buf(out))
-        except Exception:
-            # Some forks don't require/offer this; safe to ignore.
-            pass
-
-        self.prev = out
-
-    # Partial draw: no full flash
-    def _push_partial(self, img):
-        out = self._rotate(img)
-        if self.prev is not None:
+            white = _Image.new('1', (self.W, self.H), 255)
+            white = self._rotate(white)
+            self.epd.display(self._buf(white))
             try:
-                if out.tobytes() == self.prev.tobytes():
-                    return  # nothing changed
+                self.epd.Clear(0xFF)
             except Exception:
                 pass
+            # Back to PART + base
+            self._enter_partial_mode()
+            try:
+                self.epd.displayPartBaseImage(self._buf(white))
+            except Exception:
+                self.epd.displayPartial(self._buf(white))
+            self.prev = white
+            self._last_hard = time.time()
+        except Exception as e:
+            print(f"[EPD] hard refresh failed: {e}")
 
-        self._enter_partial()
-        try:
-            self.epd.displayPartial(self._buf(out))
-        except AttributeError:
-            # Fallback if method name differs; should still be partial LUT
-            self.epd.display(self._buf(out))
-        self.prev = out
-
-    # ── Screens ──────────────────────────────────────────────────────────────
+    # Screens (all push via partial — zero flashing)
     def _draw_main(self):
         img, d = self._new_layer()
         d.text((8, 8), "Swipe to choose mode", font=self.font_md, fill=0)
-
         y = int(self.H * 0.60); s = 20
         self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
         d.text((int(self.W * 0.24), y + 18), "discard", font=self.font_sm, fill=0)
         self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
         d.text((int(self.W * 0.64), y + 18), "check-in", font=self.font_sm, fill=0)
         d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
-
-        # Full refresh, then immediately prime partial mode for next screens
-        self._push_full_then_prime_partial(img)
+        self._push_partial(img)
 
     def _draw_mode(self, mode):
         img, d = self._new_layer()
         title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
         d.text((8, 8), title, font=self.font_big, fill=0)
-
-        prompt = "Hold item still ~1ft from camera"
-        d.text((8, 36), prompt, font=self.font_md, fill=0)
-
+        d.text((8, 36), "Hold item still ~1ft from camera", font=self.font_md, fill=0)
         y = int(self.H * 0.60); s = 20
         if mode == "discard":
             self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
@@ -237,7 +251,6 @@ class EpaperUI:
             self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
         else:
             d.rectangle((int(self.W*0.45), y-10, int(self.W*0.55), y+10), outline=0, width=2)
-
         d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
         self._push_partial(img)
 
@@ -245,19 +258,15 @@ class EpaperUI:
         img, d = self._new_layer()
         title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
         d.text((8, 8), title, font=self.font_big, fill=0)
-
         x0, y0, x1, y1 = 8, 36, self.W - 8, 76
-        d.rectangle((x0, y0, x1, y1), outline=0, fill=255)   # white box, then invert text by drawing black
+        d.rectangle((x0, y0, x1, y1), outline=0, fill=255)
         d.text((x0 + 10, y0 + 6), ok_text, font=self.font_md, fill=0)
-
         d.text((8, 84), "Hold item still ~1ft from camera", font=self.font_md, fill=0)
-
         y = int(self.H * 0.60); s = 20
         if mode == "discard":
             self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
         elif mode == "check_in":
             self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
-
         d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
         self._push_partial(img)
 
@@ -269,6 +278,11 @@ class EpaperUI:
         elif direction == "right":
             draw.polygon([(x+s, y), (x, y-s), (x, y+s)], outline=0, fill=0)
             draw.rectangle((x-s, y-4, x, y+4), outline=0, fill=0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Create a singleton UI (safe even if epaper libs absent)
+EPD_UI = EpaperUI()
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # Create a singleton UI (safe even if epaper libs absent)
