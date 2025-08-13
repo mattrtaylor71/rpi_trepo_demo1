@@ -1,7 +1,29 @@
-import time, os, collections, threading, queue, base64, datetime
+import time, os, collections, threading, queue, base64, datetime, csv
 import numpy as np
 import cv2
+from pathlib import Path
 from picamera2 import Picamera2
+
+INVENTORY_CSV = Path('/home/pi/fridge_inventory.csv')
+
+
+def load_inventory():
+    if not INVENTORY_CSV.exists():
+        return []
+    with INVENTORY_CSV.open('r', newline='') as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def save_inventory(rows):
+    INVENTORY_CSV.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ['item_id', 'canonical_name', 'display_name',
+                  'check_in_ts', 'expiry_ts', 'embedding']
+    with INVENTORY_CSV.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EPAPER UI (2.13" mono B/W V4) — PARTIAL-ONLY AFTER BOOT (no flashing)
