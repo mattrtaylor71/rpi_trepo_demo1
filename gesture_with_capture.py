@@ -274,14 +274,7 @@ class EpaperUI:
         tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
         x = (self.W - tw)//2; y = (self.H - th)//2
 
-        pad = 6
-        d.rectangle((x - pad, y - pad, x + tw + pad, y + th + pad), outline=0, fill=255)
         d.text((x, y), banner, font=self.font_big, fill=0)
-
-        # celebratory rays
-        cx = self.W // 2
-        for dx in (-25, 0, 25):
-            d.line((cx + dx, y - 18, cx + dx, y - 4), fill=0, width=2)
 
         # countdown bar
         bar_h = 8
