@@ -3,31 +3,20 @@ import numpy as np
 import cv2
 from picamera2 import Picamera2
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # EPAPER UI (2.13" mono B/W V4) — PARTIAL-ONLY AFTER BOOT (no flashing)
 # ─────────────────────────────────────────────────────────────────────────────
 import threading as _thr
 from queue import Queue as _Q
 try:
-    # ✅ Must use the mono driver, not tri-color
-    from waveshare_epd import epd2in13_V4 as _EPD
+    from waveshare_epd import epd2in13_V4 as _EPD   # ✅ mono driver
     from PIL import Image as _Image, ImageDraw as _Draw, ImageFont as _Font
 except Exception:
     _EPD = None
     _Image = _Draw = _Font = None
 
 class EpaperUI:
-    """
-    Strategy:
-      • Boot: FULL init + Clear (one unavoidable flash) → immediately switch to PART_UPDATE,
-        set a white base image via displayPartBaseImage(...).
-      • After that: NEVER switch back to FULL. ALL screens (main/mode/captured) use displayPartial(...).
-      • Optional: you can do a scheduled hard refresh to clean ghosting, but default is off.
-    """
-
-    # Set to >0 (seconds) if you want an occasional hard refresh to scrub ghosting
-    HARD_REFRESH_PERIOD_S = 0  # e.g., 300 for every 5 minutes; 0 disables
+    HARD_REFRESH_PERIOD_S = 0  # set >0 to occasionally scrub ghosting
 
     def __init__(self):
         self.enabled = (_EPD is not None and _Image is not None)
@@ -39,8 +28,7 @@ class EpaperUI:
         self.cur_mode = None
         self.last_screen = None
 
-        # runtime
-        self.prev = None             # last pushed PIL (1-bit) image (post-rotation)
+        self.prev = None           # last pushed PIL 1-bit (post-rotation)
         self.rotate_deg = 0
         self.rotate_180 = False
         self._last_hard = 0.0
@@ -49,7 +37,7 @@ class EpaperUI:
             self._worker = _thr.Thread(target=self._run, daemon=True)
             self._worker.start()
 
-    # Public, non-blocking
+    # Public
     def show_main(self):            self._post(("main", None))
     def show_mode_prompt(self, m):  self.cur_mode = m; self._post(("mode", m))
     def show_captured(self, m, t):  self.cur_mode = m; self._post(("captured", (m, t)))
@@ -70,7 +58,7 @@ class EpaperUI:
         try:
             self.epd = _EPD.EPD()
 
-            # 1) FULL init once + clear (boot flash)
+            # FULL once to clear (unavoidable flash)
             if hasattr(self.epd, "FULL_UPDATE"):
                 self.epd.init(self.epd.FULL_UPDATE)
             else:
@@ -80,7 +68,7 @@ class EpaperUI:
             except Exception:
                 pass
 
-            # geometry
+            # Geometry
             self.baseW, self.baseH = getattr(self.epd, "width", 0), getattr(self.epd, "height", 0)
             if self.baseH > self.baseW:
                 self.W, self.H = self.baseH, self.baseW
@@ -90,11 +78,11 @@ class EpaperUI:
                 self.rotate_deg = 0
             self.rotate_180 = False
 
-            # fonts (regular + italic fallback)
+            # Fonts
             base = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             font1 = os.path.join(base, "font", "Font.ttc")
-            italic_fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf"
-            regular_fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            italic_fb = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf"
+            regular_fb = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
             if os.path.exists(font1):
                 self.font_big = _Font.truetype(font1, 26)
                 self.font_md  = _Font.truetype(font1, 18)
@@ -102,14 +90,14 @@ class EpaperUI:
                 try:
                     self.font_italic = _Font.truetype(font1, 16)
                 except Exception:
-                    self.font_italic = _Font.truetype(italic_fallback, 16) if os.path.exists(italic_fallback) else _Font.truetype(regular_fallback, 16)
+                    self.font_italic = _Font.truetype(italic_fb, 16) if os.path.exists(italic_fb) else _Font.truetype(regular_fb, 16)
             else:
-                self.font_big = _Font.truetype(regular_fallback, 26)
-                self.font_md  = _Font.truetype(regular_fallback, 18)
-                self.font_sm  = _Font.truetype(regular_fallback, 14)
-                self.font_italic = _Font.truetype(italic_fallback, 16) if os.path.exists(italic_fallback) else _Font.truetype(regular_fallback, 16)
+                self.font_big = _Font.truetype(regular_fb, 26)
+                self.font_md  = _Font.truetype(regular_fb, 18)
+                self.font_sm  = _Font.truetype(regular_fb, 14)
+                self.font_italic = _Font.truetype(italic_fb, 16) if os.path.exists(italic_fb) else _Font.truetype(regular_fb, 16)
 
-            # 2) Immediately enter PARTIAL and set a white base image
+            # Enter PARTIAL and set a white base image
             self._enter_partial_mode()
             white = _Image.new('1', (self.W, self.H), 255)
             white = self._rotate(white)
@@ -132,17 +120,17 @@ class EpaperUI:
                 if not self.enabled:
                     continue
 
-                # Optional scheduled hard refresh (disabled by default)
+                # Optional scheduled hard refresh
                 if self.HARD_REFRESH_PERIOD_S > 0 and (time.time() - self._last_hard) >= self.HARD_REFRESH_PERIOD_S:
                     self._hard_refresh()
 
                 kind, payload = msg
-                if kind == "main":            self._draw_main()        # PARTIAL (no flash)
-                elif kind == "mode":          self._draw_mode(payload) # PARTIAL
+                if kind == "main":            self._draw_main()
+                elif kind == "mode":          self._draw_mode(payload)
                 elif kind == "captured":
                     m, ok = payload
-                    self._draw_captured(m, ok)                         # PARTIAL
-                elif kind == "timeout":       self._draw_main()        # PARTIAL
+                    self._draw_captured(m, ok)
+                elif kind == "timeout":       self._draw_main()
             except Exception as e:
                 print(f"[EPD] worker error: {e}")
             finally:
@@ -167,7 +155,6 @@ class EpaperUI:
         return self.epd.getbuffer(img)
 
     def _enter_partial_mode(self):
-        # Stick the controller in PART_UPDATE and never leave it
         try:
             if hasattr(self.epd, "PART_UPDATE"):
                 self.epd.init(self.epd.PART_UPDATE)
@@ -182,7 +169,6 @@ class EpaperUI:
 
     def _push_partial(self, img):
         out = self._rotate(img)
-        # Drop identical frames
         if self.prev is not None:
             try:
                 if out.tobytes() == self.prev.tobytes():
@@ -201,7 +187,6 @@ class EpaperUI:
         self.prev = out
 
     def _hard_refresh(self):
-        """Optional: scrub ghosting with a full cycle, then re-prime partial base."""
         try:
             if hasattr(self.epd, "FULL_UPDATE"):
                 self.epd.init(self.epd.FULL_UPDATE)
@@ -226,22 +211,19 @@ class EpaperUI:
 
     # Utility: centered boxed label
     def _centered_box_text(self, d, y, text, font, pad_x=8, pad_y=4):
-        # Measure text bbox to center
         bbox = d.textbbox((0, 0), text, font=font)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
         x = (self.W - tw) // 2
-        # Box with padding
         x0 = max(0, x - pad_x); y0 = max(0, y - pad_y)
         x1 = min(self.W - 1, x + tw + pad_x); y1 = min(self.H - 1, y + th + pad_y)
         d.rectangle((x0, y0, x1, y1), outline=0, width=1)
         d.text((x, y), text, font=font, fill=0)
-        return (x0, y0, x1, y1)  # return for reference if needed
+        return (x0, y0, x1, y1)
 
-    # Screens (all push via partial — zero flashing)
+    # Screens
     def _draw_main(self):
         img, d = self._new_layer()
-        # Keep “main” similar to before (centered title & arrows)
         self._centered_box_text(d, 6, "Swipe to choose mode", self.font_md, pad_x=10, pad_y=4)
         y = int(self.H * 0.60); s = 20
         self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
@@ -253,35 +235,25 @@ class EpaperUI:
 
     def _draw_mode(self, mode):
         img, d = self._new_layer()
-
-        # Top-center boxed mode name
         title = {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
         self._centered_box_text(d, 6, title, self.font_big, pad_x=10, pad_y=4)
-
-        # Centered italic helper line
         helper = "hold items 1–2ft away from camera"
         bbox = d.textbbox((0, 0), helper, font=self.font_italic)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
         d.text(((self.W - tw)//2, (self.H - th)//2), helper, font=self.font_italic, fill=0)
-
         d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
         self._push_partial(img)
 
     def _draw_captured(self, mode, ok_text):
         img, d = self._new_layer()
-
-        # Single centered boxed banner only (no other text)
         banner = ok_text.strip()
         bbox = d.textbbox((0, 0), banner, font=self.font_big)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        x = (self.W - tw)//2
-        y = (self.H - th)//2
+        tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
+        x = (self.W - tw)//2; y = (self.H - th)//2
         pad_x, pad_y = 12, 6
         d.rectangle((x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y), outline=0, width=2)
         d.text((x, y), banner, font=self.font_big, fill=0)
-
         self._push_partial(img)
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
@@ -293,28 +265,11 @@ class EpaperUI:
             draw.polygon([(x+s, y), (x, y-s), (x, y+s)], outline=0, fill=0)
             draw.rectangle((x-s, y-4, x, y+4), outline=0, fill=0)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Create a singleton UI (safe even if epaper libs absent)
+# Singleton UI
 EPD_UI = EpaperUI()
+
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-# --------------------------
-# OpenAI API (vision)
-# --------------------------
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-work_q = queue.Queue(maxsize=4)
-
-# --------------------------
-# OpenAI API (vision) + worker
-# --------------------------
+# OpenAI (optional worker)
 try:
     from openai import OpenAI
 except Exception:
@@ -322,52 +277,48 @@ except Exception:
 
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
 work_q = queue.Queue(maxsize=4)
-WORKER_ALIVE = False  # set True once the worker enters its loop
+WORKER_ALIVE = False
 
 def api_worker():
     global WORKER_ALIVE
     if OpenAI is None:
-        print("[OpenAI] Worker not started: openai SDK not importable.")
-        return
+        print("[OpenAI] Worker not started: openai SDK not importable."); return
     if not OPENAI_API_KEY:
-        print("[OpenAI] Worker not started: OPENAI_API_KEY is empty.")
-        return
+        print("[OpenAI] Worker not started: OPENAI_API_KEY is empty."); return
     if OPENAI_MODEL.startswith("gpt-5"):
         print("[OpenAI][WARN] gpt-5 with chat.completions may fail. Use Responses API or gpt-4o/4o-mini.")
-
     print(f"[OpenAI] Worker starting. model={OPENAI_MODEL}")
     client = OpenAI(api_key=OPENAI_API_KEY)
     WORKER_ALIVE = True
-
     while True:
         item = work_q.get()
         if item is None:
-            print("[OpenAI] Worker shutting down.")
-            break
+            print("[OpenAI] Worker shutting down."); break
         tag, jpeg_bytes = item
         try:
-            print(f"[OpenAI] Dequeued tag='{tag}', size={len(jpeg_bytes)} bytes (qsize after dequeue={work_q.qsize()})")
             b64 = base64.b64encode(jpeg_bytes).decode("ascii")
             msgs = [
-                {"role":"system","content":"You are an expert product identifier. Be concise and name the item if possible."},
+                {"role":"system","content":"You are an expert product identifier. Be concise."},
                 {"role":"user","content":[
                     {"type":"text","text":f"Identify the object. (mode={tag})"},
                     {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
                 ]},
             ]
             t0 = time.perf_counter()
-            print(f"[OpenAI] -> chat.completions.create (model={OPENAI_MODEL}, tag='{tag}')")
             resp = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
             dt_ms = (time.perf_counter() - t0) * 1000
-            print(f"[OpenAI] <- response (tag='{tag}', {dt_ms:.0f} ms)")
             text = (resp.choices[0].message.content or "").strip()
-            print(f"[{tag}] Vision -> {text if text else '<empty content>'}")
+            print(f"[OpenAI] ({tag}) {dt_ms:.0f} ms -> {text or '<empty>'}")
         except Exception as e:
             print(f"[OpenAI ERROR] tag='{tag}': {type(e).__name__}: {e}")
         finally:
             work_q.task_done()
+
+def jpeg_bytes_from_rgb(rgb, quality=92):
+    ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                           [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    return jpg.tobytes() if ok else None
 
 def enqueue_openai(tag, rgb_frame):
     os.makedirs("captures", exist_ok=True)
@@ -375,24 +326,19 @@ def enqueue_openai(tag, rgb_frame):
     path = f"captures/{tag}_{ts}.jpg"
     jpg = jpeg_bytes_from_rgb(rgb_frame, 92)
     if jpg is None:
-        print(f"[enqueue] {tag}: JPEG encode failed")
-        return
+        print(f"[enqueue] {tag}: JPEG encode failed"); return
     with open(path, "wb") as f:
         f.write(jpg)
     print(f"[enqueue] {tag}: saved {path} ({len(jpg)} bytes)")
     if not WORKER_ALIVE:
-        print("[enqueue][WARN] OpenAI worker not running. Check OPENAI_API_KEY and import. Skipping enqueue.")
-        return
+        print("[enqueue][WARN] OpenAI worker not running; skipping enqueue."); return
     try:
         work_q.put_nowait((tag, jpg))
         print(f"[enqueue] {tag}: enqueued. qsize={work_q.qsize()}")
     except queue.Full:
         print(f"[enqueue] {tag}: queue full, skipped")
 
-# spin up worker (do this once after defs)
 threading.Thread(target=api_worker, daemon=True).start()
-
-# Optional: tiny watchdog to show queue health every ~5s
 def q_watchdog():
     while True:
         time.sleep(5)
@@ -401,9 +347,8 @@ threading.Thread(target=q_watchdog, daemon=True).start()
 
 EPD_UI.show_main()
 
-# =========================
-# Swipe detector config
-# =========================
+# ─────────────────────────────────────────────────────────────────────────────
+# Gesture + capture
 FRAME_W, FRAME_H = 640, 480
 LO_W, LO_H       = 192, 108
 
@@ -434,43 +379,36 @@ HEADLESS = os.environ.get("DISPLAY", "") == ""
 CAPTURE_COOLDOWN_S = 0.8
 last_capture_t = 0.0
 
-# =========================
-# Stability / presence gating after a mode is set
-# =========================
+# Stability / thresholds
 WAIT_AFTER_SWIPE_S   = 0.9
 STABILITY_WINDOW_FR  = 8
-MOTION_EMA_ALPHA     = 0.15
+MOTION_EMA_ALPHA     = 0.25              # single source of truth
 
-PRESENCE_LAPLACE_MIN = 18.0          # was 28.0 — easier to satisfy in soft light
-PRESENCE_LAPLACE_GAIN = 1.20         # was 1.3 — less aggressive bump
-MAX_LAPLACE_THR = 85.0               # new: hard cap so threshold can't run away
+PRESENCE_LAPLACE_MIN = 6.0
+PRESENCE_LAPLACE_GAIN = 1.20
+MAX_LAPLACE_THR      = 85.0
 
-MOTION_THR_SCALE = 1.9               # was 2.3 — slightly easier to pass
+MOTION_THR_SCALE = 1.9
 MOTION_THR_FLOOR = 0.004
-MAX_MOTION_THR   = 0.06              # new: don’t let dyn motion threshold exceed this
+MAX_MOTION_THR   = 0.06
 
-ARM_TIMEOUT_S         = 8.0
-MOTION_EMA_ALPHA      = 0.25
+STEADY_OVERRIDE_AFTER_S = 1.6            # safety valve
 
-# Stability hysteresis / dwell
-ENTER_RELAX = 1.00
-EXIT_RELAX  = 1.20
-MIN_STABLE_S = 0.35
-CONFIRM_FR   = 2
+ARM_TIMEOUT_S    = 8.0
+ENTER_RELAX      = 1.00
+EXIT_RELAX       = 1.20
+MIN_STABLE_S     = 0.35
+CONFIRM_FR       = 2
 
 stable_since = None
 confirm_left = 0
 
-# Require removal (low-detail) before re-arming
 CLEAR_LAPLACE_FRAC = 0.65
 CLEAR_WINDOW_FR    = 6
-
 need_clear  = False
 clear_count = 0
 
-# =========================
 # Helpers
-# =========================
 def y_plane(yuv):
     if yuv.ndim == 2:  return yuv[:LO_H, :LO_W]
     if yuv.ndim == 3:  return yuv[:, :, 0]
@@ -480,11 +418,6 @@ def smooth1d(v, k):
     if k <= 0: return v
     ksz = 2*k + 1
     return np.convolve(v, np.ones(ksz, np.float32)/ksz, mode="same")
-
-def jpeg_bytes_from_rgb(rgb, quality=92):
-    ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-                           [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    return jpg.tobytes() if ok else None
 
 def laplacian_sharpness(gray_u8):
     return cv2.Laplacian(gray_u8, cv2.CV_64F).var()
@@ -496,49 +429,39 @@ def center_laplacian(bgr):
     crop = cv2.cvtColor(bgr[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
     return laplacian_sharpness(crop)
 
-# =========================
-# Camera (video + still modes)
-# =========================
+# Camera
 picam2 = Picamera2()
-
 video_cfg = picam2.create_video_configuration(
     main={"format":"RGB888","size":(FRAME_W, FRAME_H)},
     lores={"format":"YUV420","size":(LO_W, LO_H)},
     display="main",
 )
-
 STILL_W, STILL_H = 2304, 1296
 still_cfg = picam2.create_still_configuration(
-    main={"format":"RGB888","size":(STILL_W, STILL_H)},
-    display=None,
+    main={"format":"RGB888","size":(STILL_W, STILL_H)}, display=None,
 )
-
 picam2.configure(video_cfg)
 try:
     picam2.set_controls({
         "AeEnable": True, "AwbEnable": True,
         "AfMode": 2,
-        "FrameDurationLimits": (10000, 10000),  # fast preview
+        "FrameDurationLimits": (10000, 10000),
         "AnalogueGain": 12.0,
     })
 except Exception:
     pass
 picam2.start()
-
-cam_lock = threading.Lock()  # guards mode switches and frame grabs
+cam_lock = threading.Lock()
 
 def capture_high_quality(tag: str):
     with cam_lock:
         try:
             try:
-                picam2.set_controls({"AfMode": 1})       # single-shot AF
-                picam2.set_controls({"AfTrigger": 1})
+                picam2.set_controls({"AfMode": 1}); picam2.set_controls({"AfTrigger": 1})
             except Exception:
                 picam2.set_controls({"AfMode": 2})
-
             picam2.switch_mode(still_cfg)
-            time.sleep(0.22)  # AE/AF settle
-
+            time.sleep(0.22)
             frames, scores = [], []
             for _ in range(4):
                 arr = picam2.capture_array("main")
@@ -566,9 +489,7 @@ def capture_high_quality(tag: str):
 def start_capture_thread(tag):
     threading.Thread(target=capture_high_quality, args=(tag,), daemon=True).start()
 
-# =========================
-# Swipe + Mode state
-# =========================
+# State
 prev_lo_blur = None
 mask_pool = collections.deque(maxlen=POOL_FRAMES)
 trace_x, trace_y = collections.deque(), collections.deque()
@@ -590,14 +511,13 @@ armed = False
 arm_time = 0.0
 stable_count = 0
 
-# Adaptive stability thresholds
 motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
 lap_baseline = 0.0
 lap_thr_dyn  = PRESENCE_LAPLACE_MIN
 
-FLIP_X = True   # flips left/right interpretation
-FLIP_Y = False  # set True if up/down feel reversed
+FLIP_X = True
+FLIP_Y = False
 
 def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
@@ -605,36 +525,31 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global need_clear, stable_since, confirm_left
 
     m = MODE_MAP.get(gesture)
-    if not m:
-        return
+    if not m: return
     current_mode = m
     armed = True
     need_clear = False
     arm_time = now_ts
     stable_count = 0
-    stable_since = None          # NEW: reset dwell timer
-    confirm_left = 0             # NEW: reset confirm counter
+    stable_since = None
+    confirm_left = 0
 
-    # Seed sharpness baseline + clamp
     if bgr_for_baseline is not None:
-        lap = center_laplacian(bgr_for_baseline)
-        lap_baseline = lap
-        lap_thr_dyn  = max(PRESENCE_LAPLACE_MIN, lap * PRESENCE_LAPLACE_GAIN)
-        lap_thr_dyn  = min(lap_thr_dyn, MAX_LAPLACE_THR)  # NEW cap
+        lap_baseline = center_laplacian(bgr_for_baseline)
+        lap_thr_dyn  = max(PRESENCE_LAPLACE_MIN, lap_baseline * PRESENCE_LAPLACE_GAIN)
+        lap_thr_dyn  = min(lap_thr_dyn, MAX_LAPLACE_THR)
     else:
-        lap_thr_dyn = PRESENCE_LAPLACE_MIN
+        lap_baseline = 0.0
+        lap_thr_dyn  = PRESENCE_LAPLACE_MIN
 
     print(f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f}  lap_thr={lap_thr_dyn:.1f}")
-
 
 try:
     while True:
         now = time.time()
 
-        # Skip reads during still capture
         if not cam_lock.acquire(blocking=False):
-            time.sleep(0.005)
-            continue
+            time.sleep(0.005); continue
         try:
             lo  = y_plane(picam2.capture_array("lores"))
             rgb = picam2.capture_array("main")
@@ -645,8 +560,6 @@ try:
         dbg = bgr.copy()
 
         x_norm = y_norm = None
-
-        # --- Preprocess lores for robust motion: blur + diff + pool ---
         lo_blur = cv2.GaussianBlur(lo, (3,3), 0)
 
         if prev_lo_blur is not None:
@@ -656,7 +569,6 @@ try:
             for i in range(1, len(mask_pool)):
                 pooled = cv2.bitwise_or(pooled, mask_pool[i])
 
-            # Horizontal (columns) in vertical band
             band_h = pooled[y0:y1, :]
             col = band_h.astype(np.float32).sum(axis=0)
             if col.sum() >= ENERGY_MIN_FRAC * (255.0 * (y1 - y0) * LO_W):
@@ -666,18 +578,11 @@ try:
                 if wsum > 1e-3:
                     cx_raw = float((col_s * xs).sum() / wsum) / LO_W
                     x_norm = (1.0 - cx_raw) if FLIP_X else cx_raw
-
-                    # debug bar across the top
                     bar = (col_s / (col_s.max()+1e-6) * 255.0).astype(np.uint8)
-                    if FLIP_X:
-                        bar = bar[::-1]  # mirror the debug histogram too
-                    dbg[0:40, 0:FRAME_W] = cv2.resize(
-                        cv2.cvtColor(np.tile(bar, (40, 1)), cv2.COLOR_GRAY2BGR),
-                        (FRAME_W, 40)
-                    )
+                    if FLIP_X: bar = bar[::-1]
+                    dbg[0:40, 0:FRAME_W] = cv2.resize(cv2.cvtColor(np.tile(bar, (40, 1)), cv2.COLOR_GRAY2BGR),(FRAME_W, 40))
                     cv2.line(dbg, (int(x_norm*FRAME_W), 40), (int(x_norm*FRAME_W), 70), (255,255,255), 2)
 
-            # Vertical (rows) in horizontal band
             band_v = pooled[:, x0:x1]
             row = band_v.astype(np.float32).sum(axis=1)
             if row.sum() >= ENERGY_MIN_FRAC * (255.0 * (x1 - x0) * LO_H):
@@ -687,39 +592,28 @@ try:
                 if wsum > 1e-3:
                     cy_raw = float((row_s * ys).sum() / wsum) / LO_H
                     y_norm = (1.0 - cy_raw) if FLIP_Y else cy_raw
-
-                    # debug bar on the right edge
                     barv = (row_s / (row_s.max()+1e-6) * 255.0).astype(np.uint8)
                     barv = np.tile(barv[:, None], (1, 40))
-                    if FLIP_Y:
-                        barv = barv[::-1, :]
+                    if FLIP_Y: barv = barv[::-1, :]
                     barv = cv2.cvtColor(barv, cv2.COLOR_GRAY2BGR)
                     barv = cv2.resize(barv, (40, FRAME_H))
                     dbg[0:FRAME_H, FRAME_W-40:FRAME_W] = barv
                     cv2.line(dbg, (FRAME_W-40, int(y_norm*FRAME_H)), (FRAME_W, int(y_norm*FRAME_H)), (255,255,255), 2)
 
-            # --- Motion in the central band only (less background noise) ---
+            # Motion in central band
             center_band = pooled[int(LO_H*0.20):int(LO_H*0.80), int(LO_W*0.20):int(LO_W*0.80)]
             motion_now = float(center_band.sum()) / (255.0 * center_band.size)
+            motion_ema = motion_now if motion_ema is None else (MOTION_EMA_ALPHA * motion_now + (1.0 - MOTION_EMA_ALPHA) * motion_ema)
 
-            # EMA smoothing
-            if motion_ema is None:
-                motion_ema = motion_now
-            else:
-                motion_ema = MOTION_EMA_ALPHA * motion_now + (1.0 - MOTION_EMA_ALPHA) * motion_ema
-
-            # show motion bar
-            m_norm = np.clip(motion_ema / 0.02, 0.0, 1.0)  # visualize vs 2% motion
+            # HUD motion bar
+            m_norm = np.clip(motion_ema / 0.02, 0.0, 1.0)
             cv2.rectangle(dbg, (20, 50), (20 + int(200*(1.0 - m_norm)), 65), (255,255,255), -1)
-            cv2.putText(dbg, f"MOTION ema={motion_ema:.4f} thr={motion_thr_dyn:.4f}",
-                        (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
+            cv2.putText(dbg, f"MOTION ema={motion_ema:.4f} thr={motion_thr_dyn:.4f}", (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
 
         prev_lo_blur = lo_blur
 
-        # ---- Maintain swipe traces for gates/fallbacks ----
-        SPAN_WINDOW_S = 0.28
+        # Maintain traces
         now_ts = now
-
         while trace_x and (now - trace_x[0][0]) > SPAN_WINDOW_S: trace_x.popleft()
         while trace_y and (now - trace_y[0][0]) > SPAN_WINDOW_S: trace_y.popleft()
         if x_norm is not None: trace_x.append((now, x_norm)); last_seen_t_x = now
@@ -734,20 +628,18 @@ try:
             ys = [p[1] for p in trace_y]; ts2 = [p[0] for p in trace_y]
             span_y = max(ys) - min(ys); dt2 = max(1e-3, ts2[-1]-ts2[0]); vel_y = (ys[-1]-ys[0])/dt2
 
-        # ---- Swipes -> set MODE (no immediate capture) ----
+        # Mode setting
         gesture_text = ""
         can_fire = (now - last_fire) > COOLDOWN_S
 
         def set_mode_and_seed(gesture: str):
             global motion_thr_dyn
-            # use current ema if present; else floor
             ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
-            motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))  # NEW cap
+            motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))
             set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
             EPD_UI.show_mode_prompt(current_mode)
             cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
-        # Horizontal gates
         if x_norm is not None:
             if state_x == "IDLE":
                 if x_norm <= L_ARM: state_x = "ARM_RIGHT"
@@ -762,7 +654,6 @@ try:
         else:
             if state_x != "IDLE" and (now - last_seen_t_x) > ABSENCE_RESET_S: state_x = "IDLE"
 
-        # Vertical gates
         if y_norm is not None and gesture_text == "":
             if state_y == "IDLE":
                 if y_norm <= T_ARM: state_y = "ARM_DOWN"
@@ -777,14 +668,11 @@ try:
         else:
             if state_y != "IDLE" and (now - last_seen_t_y) > ABSENCE_RESET_S: state_y = "IDLE"
 
-        # Span/velocity fallback
         if can_fire and gesture_text == "" and span_x >= SPAN_THR_X and abs(vel_x) >= VEL_THR_X:
             g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
             print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
 
-        # ---------------------------
-        # Armed: wait-for-stability (adaptive)
-        # ---------------------------
+        # Armed: stability gate
         if armed:
             if (now - last_capture_t) < CAPTURE_COOLDOWN_S:
                 stable_count = 0
@@ -796,7 +684,6 @@ try:
                 stable_count = 0
             else:
                 lap_c = center_laplacian(bgr)
-
                 thr_enter = motion_thr_dyn * ENTER_RELAX
                 thr_exit  = motion_thr_dyn * EXIT_RELAX
 
@@ -804,11 +691,15 @@ try:
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
-                # NEW: quick trace of the two gates
-                if int(time.time() * 5) % 5 == 0:  # ~5x/sec without spamming
+                # Safety valve: very steady for a while → allow
+                if not sharp_enough and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
+                    sharp_enough = True
+                    print("[stable?] overriding sharpness gate due to sustained steadiness")
+
+                # Debug (light rate-limit)
+                if int(time.time() * 5) % 5 == 0:
                     print(f"[stable?] motion_ema={motion_ema:.4f} thr={thr_enter:.4f} "
                           f"lap={lap_c:.1f}/{lap_thr_dyn:.1f} ok_mo={below_enter} ok_sh={sharp_enough}")
-
 
                 if above_exit or not sharp_enough:
                     stable_count = 0
@@ -832,13 +723,10 @@ try:
                                 arm_time = now
                                 stable_count = 0
                                 stable_since = None
-
                                 need_clear = True
                                 armed = False
                                 clear_count = 0
                                 print("[mode] captured; waiting for item removal to re-arm")
-                else:
-                    confirm_left = 0
 
                 # HUD (optional)
                 closeness = 1.0 - np.clip((motion_ema or 0.0) / (motion_thr_dyn or 1e-6), 0.0, 1.0)
@@ -846,24 +734,18 @@ try:
                 cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR} dwell>={MIN_STABLE_S:.2f}s lap={int(lap_c)}>={int(lap_thr_dyn)}",
                             (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
 
-        # Re-arm when item is removed (center detail goes low for a few frames)
+        # Re-arm when item removed (low detail for a few frames)
         if need_clear:
             lap_c = center_laplacian(bgr)
             clear_thr = max(PRESENCE_LAPLACE_MIN * 0.8, lap_thr_dyn * CLEAR_LAPLACE_FRAC)
-            if lap_c < clear_thr:
-                clear_count += 1
-            else:
-                clear_count = 0
-
+            clear_count = clear_count + 1 if lap_c < clear_thr else 0
             if clear_count >= CLEAR_WINDOW_FR:
                 need_clear = False
                 armed = True
                 arm_time = now
-                print("[mode] scene cleared; re-armed for next item")
-                # ⬇️ Draw the mode prompt again automatically after re-arming
+                print("[mode] scene cleared; re-armed")
                 if current_mode:
                     EPD_UI.show_mode_prompt(current_mode)
-
             cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
         # HUD
@@ -887,8 +769,13 @@ try:
             time.sleep(0.002)
 
 finally:
-    picam2.stop()
+    try:
+        picam2.stop()
+    except Exception:
+        pass
     if not HEADLESS:
         cv2.destroyAllWindows()
-    try: work_q.put_nowait(None)
-    except queue.Full: pass
+    try:
+        work_q.put_nowait(None)
+    except queue.Full:
+        pass
