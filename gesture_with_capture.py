@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 from pathlib import Path
 from picamera2 import Picamera2
+from inventory import handle_discard
 from inventory import add_inventory_item
 
 INVENTORY_CSV = Path('/home/pi/fridge_inventory.csv')
@@ -413,6 +414,16 @@ def api_worker():
             dt_ms = (time.perf_counter() - t0) * 1000
             text = (resp.choices[0].message.content or "").strip()
             print(f"[OpenAI] ({tag}) {dt_ms:.0f} ms -> {text or '<empty>'}")
+            if tag == "discard":
+                canonical_name = text
+                embedding = None
+                try:
+                    emb_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+                    emb_resp = client.embeddings.create(model=emb_model, input=canonical_name)
+                    embedding = np.array(emb_resp.data[0].embedding, dtype=float)
+                except Exception as e:
+                    print(f"[OpenAI] embedding error: {e}")
+                handle_discard(canonical_name, embedding, client)
 
             if tag == "check_in":
                 canonical = text.lower()
