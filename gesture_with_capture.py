@@ -1,4 +1,4 @@
-import time, os, collections, threading, queue, base64, datetime
+import time, os, collections, threading, queue, base64, datetime, csv
 import numpy as np
 import cv2
 from picamera2 import Picamera2
@@ -322,6 +322,67 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 work_q = queue.Queue(maxsize=4)
 WORKER_ALIVE = False
 
+CSV_PATH = "fridge_items.csv"
+pending_item_name = None
+inventory_lock = threading.Lock()
+
+def load_inventory():
+    if not os.path.exists(CSV_PATH):
+        return []
+    with open(CSV_PATH, newline="") as f:
+        return list(csv.DictReader(f))
+
+def save_inventory(rows):
+    with open(CSV_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["name", "expiry"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+def add_inventory_item(name, expiry):
+    with inventory_lock:
+        rows = load_inventory()
+        rows.append({"name": name, "expiry": expiry})
+        save_inventory(rows)
+
+def match_discarded_item(discard_name, inventory_names, client):
+    if not inventory_names:
+        return "NONE"
+    items = "\n".join(f"- {n}" for n in inventory_names)
+    msgs = [
+        {"role": "system", "content": "Match the discarded item to one inventory item. Reply with the exact item or NONE."},
+        {"role": "user", "content": f"Discarded item: {discard_name}\nInventory items:\n{items}"},
+    ]
+    resp = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs)
+    return (resp.choices[0].message.content or "").strip()
+
+def remove_inventory_item(discard_name, client):
+    rows = load_inventory()
+    names = [r["name"] for r in rows]
+    match = match_discarded_item(discard_name, names, client)
+    if match in names:
+        idx = names.index(match)
+        removed = rows.pop(idx)
+        with inventory_lock:
+            save_inventory(rows)
+        print(f"[inventory] removed {removed['name']} exp {removed['expiry']}")
+    else:
+        print(f"[inventory] no match for '{discard_name}' (model -> {match})")
+
+def handle_openai_result(tag, text, client):
+    global pending_item_name
+    if tag == "check_in":
+        pending_item_name = text
+        print(f"[inventory] pending: {pending_item_name}")
+    elif tag == "expiry":
+        if pending_item_name:
+            add_inventory_item(pending_item_name, text)
+            print(f"[inventory] added: {pending_item_name} exp {text}")
+            pending_item_name = None
+        else:
+            print(f"[inventory] no pending item for expiry '{text}'")
+    elif tag == "discard":
+        remove_inventory_item(text, client)
+
 def api_worker():
     global WORKER_ALIVE
     if OpenAI is None:
@@ -366,6 +427,7 @@ def api_worker():
             dt_ms = (time.perf_counter() - t0) * 1000
             text = (resp.choices[0].message.content or "").strip()
             print(f"[OpenAI] ({tag}) {dt_ms:.0f} ms -> {text or '<empty>'}")
+            handle_openai_result(tag, text, client)
         except Exception as e:
             print(f"[OpenAI ERROR] tag='{tag}': {type(e).__name__}: {e}")
         finally:
