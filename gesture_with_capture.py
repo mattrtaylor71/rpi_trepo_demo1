@@ -45,6 +45,8 @@ class EpaperUI:
     def show_captured(self, m, t, frac=1.0):
         self.cur_mode = m
         self._post(("captured", (m, t, frac)))
+    def show_expiry_prompt(self):
+        self._post(("expiry", None))
     def show_timeout(self):
         self.cur_mode = None
         self._post(("timeout", None))
@@ -138,6 +140,7 @@ class EpaperUI:
                 elif kind == "captured":
                     m, ok, frac = payload
                     self._draw_captured(m, ok, frac)
+                elif kind == "expiry":       self._draw_expiry()
                 elif kind == "timeout":       self._draw_main()
             except Exception as e:
                 print(f"[EPD] worker error: {e}")
@@ -288,6 +291,11 @@ class EpaperUI:
         d.rectangle((0, bar_y0, self.W, bar_y0 + bar_h), outline=0, fill=255)
         d.rectangle((0, bar_y0, int(self.W * max(0.0, min(1.0, frac))), bar_y0 + bar_h), outline=0, fill=0)
 
+        self._push_partial(img)
+
+    def _draw_expiry(self):
+        img, d = self._new_layer()
+        self._centered_text(d, 6, "Log expiration date?", self.font_md)
         self._push_partial(img)
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
@@ -723,6 +731,14 @@ try:
             g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
             print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
 
+        # Expiration prompt timeout
+        if awaiting_expiry and (now - expiry_prompt_time) > EXPIRY_WAIT_S:
+            awaiting_expiry = False
+            need_clear = True
+            armed = False
+            clear_count = 0
+            print("[expiry] timeout; awaiting item removal")
+
         # ---------------------------
         # Armed: wait-for-stability
         # ---------------------------
@@ -843,7 +859,7 @@ try:
                                         print("[mode] captured; waiting for item removal to re-arm")
 
         # Re-arm when item is removed (center detail low for a few frames + min time)
-        if need_clear:
+        if need_clear or awaiting_expiry:
             lap_c = center_laplacian(bgr)
             clear_thr = max(PRESENCE_LAPLACE_MIN * 0.8, lap_thr_dyn * CLEAR_LAPLACE_FRAC)
             if lap_c < clear_thr:
@@ -853,14 +869,25 @@ try:
 
             ready_by_time = (now - last_capture_t) >= MIN_CLEAR_S
             if ready_by_time and clear_count >= CLEAR_WINDOW_FR:
-                need_clear = False
-                armed = True
-                arm_time = now
-                countdown_last_sec = -1
-                presence_dwell_start = None
-                print("[mode] scene cleared; re-armed")
-                if current_mode:
-                    EPD_UI.show_mode_prompt(current_mode, 1.0)
+                if awaiting_expiry:
+                    awaiting_expiry = False
+                    armed = True
+                    arm_time = now
+                    countdown_last_sec = -1
+                    presence_dwell_start = None
+                    clear_count = 0
+                    print("[expiry] item removed; re-armed")
+                    if current_mode:
+                        EPD_UI.show_mode_prompt(current_mode, 1.0)
+                else:
+                    need_clear = False
+                    armed = True
+                    arm_time = now
+                    countdown_last_sec = -1
+                    presence_dwell_start = None
+                    print("[mode] scene cleared; re-armed")
+                    if current_mode:
+                        EPD_UI.show_mode_prompt(current_mode, 1.0)
 
             cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
