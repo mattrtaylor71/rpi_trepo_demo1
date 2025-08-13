@@ -209,40 +209,47 @@ class EpaperUI:
         except Exception as e:
             print(f"[EPD] hard refresh failed: {e}")
 
-    # Utility: centered boxed label
-    def _centered_box_text(self, d, y, text, font, pad_x=8, pad_y=4):
+    # Utility: centered label
+    def _centered_text(self, d, y, text, font):
         bbox = d.textbbox((0, 0), text, font=font)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
         x = (self.W - tw) // 2
-        x0 = max(0, x - pad_x); y0 = max(0, y - pad_y)
-        x1 = min(self.W - 1, x + tw + pad_x); y1 = min(self.H - 1, y + th + pad_y)
-        d.rectangle((x0, y0, x1, y1), outline=0, width=1)
         d.text((x, y), text, font=font, fill=0)
-        return (x0, y0, x1, y1)
+        return (x, y, x + tw, y + th)
 
     # Screens
     def _draw_main(self):
         img, d = self._new_layer()
-        self._centered_box_text(d, 6, "Swipe to choose mode", self.font_md, pad_x=10, pad_y=4)
+        self._centered_text(d, 6, "Swipe to choose mode", self.font_md)
         y = int(self.H * 0.60); s = 20
-        self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
-        d.text((int(self.W * 0.24), y + 18), "discard", font=self.font_sm, fill=0)
-        self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
-        d.text((int(self.W * 0.64), y + 18), "check-in", font=self.font_sm, fill=0)
-        d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
+        left_x = int(self.W * 0.30)
+        right_x = int(self.W * 0.70)
+        self._arrow(d, x=left_x, y=y, size=s, direction="left")
+        bbox = d.textbbox((0, 0), "discard", font=self.font_sm)
+        tw = bbox[2] - bbox[0]
+        d.text((left_x - tw // 2, y + 18), "discard", font=self.font_sm, fill=0)
+        self._arrow(d, x=right_x, y=y, size=s, direction="right")
+        bbox = d.textbbox((0, 0), "check-in", font=self.font_sm)
+        tw = bbox[2] - bbox[0]
+        d.text((right_x - tw // 2, y + 18), "check-in", font=self.font_sm, fill=0)
         self._push_partial(img)
 
     def _draw_mode(self, mode):
         img, d = self._new_layer()
         title = {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
-        self._centered_box_text(d, 6, title, self.font_big, pad_x=10, pad_y=4)
-        helper = "hold items 1–2ft away from camera"
-        bbox = d.textbbox((0, 0), helper, font=self.font_italic)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        d.text(((self.W - tw)//2, (self.H - th)//2), helper, font=self.font_italic, fill=0)
-        d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
+        self._centered_text(d, 6, title, self.font_big)
+        line1 = "hold items"
+        line2 = "1–2ft away from camera"
+        bbox1 = d.textbbox((0, 0), line1, font=self.font_italic)
+        bbox2 = d.textbbox((0, 0), line2, font=self.font_italic)
+        tw1, th1 = bbox1[2] - bbox1[0], bbox1[3] - bbox1[1]
+        tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
+        gap = 4
+        total_h = th1 + gap + th2
+        y0 = (self.H - total_h) // 2
+        d.text(((self.W - tw1) // 2, y0), line1, font=self.font_italic, fill=0)
+        d.text(((self.W - tw2) // 2, y0 + th1 + gap), line2, font=self.font_italic, fill=0)
         self._push_partial(img)
 
     def _draw_captured(self, mode, ok_text):
@@ -251,8 +258,6 @@ class EpaperUI:
         bbox = d.textbbox((0, 0), banner, font=self.font_big)
         tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
         x = (self.W - tw)//2; y = (self.H - th)//2
-        pad_x, pad_y = 12, 6
-        d.rectangle((x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y), outline=0, width=2)
         d.text((x, y), banner, font=self.font_big, fill=0)
         self._push_partial(img)
 
