@@ -247,48 +247,37 @@ class EpaperUI:
     def _draw_main(self):
         img, d = self._new_layer()
 
-        s = 14
+        s = 8
         mid_x = self.W // 2
         mid_y = self.H // 2
-        gap = 4
+        offset = s + 12
 
-        # Left/right arrows near center
-        self._arrow(d, x=mid_x - gap - s, y=mid_y, size=s, direction="left")
-        self._arrow(d, x=mid_x + gap + s, y=mid_y, size=s, direction="right")
+        # Arrows equally spaced around center
+        self._arrow(d, x=mid_x - offset, y=mid_y, size=s, direction="left")
+        self._arrow(d, x=mid_x + offset, y=mid_y, size=s, direction="right")
+        self._arrow(d, x=mid_x, y=mid_y - offset, size=s, direction="up")
+        self._arrow(d, x=mid_x, y=mid_y + offset, size=s, direction="down")
 
-        # Vertical labels on edges with small inset and padding to avoid clipping
-        inset = 2
+        # Labels (all horizontal)
         label = "Discard"
         bbox = d.textbbox((0, 0), label, font=self.font_sm)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        timg = _Image.new('1', (tw + 2, th + 2), 255)
-        td = _Draw.Draw(timg)
-        td.text((1, 1), label, font=self.font_sm, fill=0)
-        timg = timg.rotate(90, expand=True)
-        img.paste(timg, (inset, (self.H - timg.height) // 2))
+        d.text((mid_x - offset - s - tw - 4, mid_y - th // 2), label, font=self.font_sm, fill=0)
 
         label = "Check-in"
         bbox = d.textbbox((0, 0), label, font=self.font_sm)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        timg = _Image.new('1', (tw + 2, th + 2), 255)
-        td = _Draw.Draw(timg)
-        td.text((1, 1), label, font=self.font_sm, fill=0)
-        timg = timg.rotate(270, expand=True)
-        img.paste(timg, (self.W - timg.width - inset, (self.H - timg.height) // 2))
+        d.text((mid_x + offset + s + 4, mid_y - th // 2), label, font=self.font_sm, fill=0)
 
-        # Up arrow + label
-        y = 10 + s
-        self._arrow(d, x=mid_x, y=y, size=s, direction="up")
-        bbox = d.textbbox((0, 0), "Inventory", font=self.font_sm)
-        tw = bbox[2] - bbox[0]
-        d.text((mid_x - tw // 2, y - s - 12), "Inventory", font=self.font_sm, fill=0)
+        label = "Inventory"
+        bbox = d.textbbox((0, 0), label, font=self.font_sm)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        d.text((mid_x - tw // 2, mid_y - offset - s - th - 4), label, font=self.font_sm, fill=0)
 
-        # Down arrow + label
-        y = self.H - 10 - s
-        self._arrow(d, x=mid_x, y=y, size=s, direction="down")
-        bbox = d.textbbox((0, 0), "Opened", font=self.font_sm)
-        tw = bbox[2] - bbox[0]
-        d.text((mid_x - tw // 2, y + s + 4), "Opened", font=self.font_sm, fill=0)
+        label = "Opened"
+        bbox = d.textbbox((0, 0), label, font=self.font_sm)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        d.text((mid_x - tw // 2, mid_y + offset + s + 4), label, font=self.font_sm, fill=0)
 
         self._push_partial(img)
 
@@ -902,11 +891,11 @@ try:
                 inventory_last_gesture = now
                 if gesture == "SWIPE_LEFT":
                     if inventory_rows:
-                        inventory_idx = (inventory_idx + 1) % len(inventory_rows)
+                        inventory_idx = (inventory_idx - 1) % len(inventory_rows)
                         EPD_UI.clear_queue()
                 elif gesture == "SWIPE_RIGHT":
                     if inventory_rows:
-                        inventory_idx = (inventory_idx - 1) % len(inventory_rows)
+                        inventory_idx = (inventory_idx + 1) % len(inventory_rows)
                         EPD_UI.clear_queue()
                 elif gesture == "SWIPE_DOWN":
                     inventory_mode = False
@@ -1042,19 +1031,17 @@ try:
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
+                # Safety valve (optional): very steady for a while → let sharpness slide
+                if (not sharp_enough) and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
+                    sharp_enough = True
+                    print("[stable?] overriding sharpness due to sustained steadiness")
+
                 # Presence dwell: start timing only when BOTH gates are met
                 if below_enter and sharp_enough:
                     if presence_dwell_start is None:
                         presence_dwell_start = now
                 else:
                     presence_dwell_start = None
-
-                # Safety valve (optional): very steady for a while → let sharpness slide
-                if (not sharp_enough) and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
-                    sharp_enough = True
-                    if presence_dwell_start is None:
-                        presence_dwell_start = now  # begin dwell from now
-                    print("[stable?] overriding sharpness due to sustained steadiness")
 
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
