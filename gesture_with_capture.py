@@ -246,15 +246,26 @@ class EpaperUI:
     # Screens
     def _draw_main(self):
         img, d = self._new_layer()
-        bbox = d.textbbox((0, 0), "swipe", font=self.font_big)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        self._centered_text(d, (self.H - th) // 2, "swipe", self.font_big)
 
         s = 14
         mid_x = self.W // 2
         mid_y = self.H // 2
+        gap = 4
 
+        # Left/right arrows near center
+        self._arrow(d, x=mid_x - gap - s, y=mid_y, size=s, direction="left")
+        self._arrow(d, x=mid_x + gap + s, y=mid_y, size=s, direction="right")
+
+        # Vertical labels on edges with small inset and padding to avoid clipping
+        inset = 2
+        label = "Discard"
+        bbox = d.textbbox((0, 0), label, font=self.font_sm)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        timg = _Image.new('1', (tw + 2, th + 2), 255)
+        td = _Draw.Draw(timg)
+        td.text((1, 1), label, font=self.font_sm, fill=0)
+        timg = timg.rotate(90, expand=True)
+        img.paste(timg, (inset, (self.H - timg.height) // 2))
         # Left/right arrows near center but outside text
         text_left = (self.W - tw) // 2
         text_right = text_left + tw
@@ -277,6 +288,11 @@ class EpaperUI:
         label = "Check-in"
         bbox = d.textbbox((0, 0), label, font=self.font_sm)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        timg = _Image.new('1', (tw + 2, th + 2), 255)
+        td = _Draw.Draw(timg)
+        td.text((1, 1), label, font=self.font_sm, fill=0)
+        timg = timg.rotate(270, expand=True)
+        img.paste(timg, (self.W - timg.width - inset, (self.H - timg.height) // 2))
         timg = _Image.new('1', (tw, th), 255)
         td = _Draw.Draw(timg)
         td.text((0, 0), label, font=self.font_sm, fill=0)
@@ -375,13 +391,19 @@ class EpaperUI:
             y = 6
             lines = self._wrap_lines(d, item.get("name", ""), self.font_md, self.W - 4, 2)
             for line in lines:
-                d.text((2, y), line, font=self.font_md, fill=0)
+                self._centered_text(d, y, line, self.font_md)
                 y += 18
             y += 4
-            d.text((2, y), f"expiry: {item.get('expiry', '')}", font=self.font_sm, fill=0)
+            self._centered_text(d, y, f"expiry: {item.get('expiry', '')}", self.font_sm)
             y += 16
             opened = item.get('opened_date') or "--"
-            d.text((2, y), f"opened: {opened}", font=self.font_sm, fill=0)
+            self._centered_text(d, y, f"opened: {opened}", self.font_sm)
+
+        # Scroll arrows
+        mid_y = self.H // 2
+        s = 8
+        self._arrow(d, x=3 + s, y=mid_y, size=s, direction="left")
+        self._arrow(d, x=self.W - 3 - s, y=mid_y, size=s, direction="right")
 
         # Scroll arrows
         mid_y = self.H // 2
@@ -391,8 +413,10 @@ class EpaperUI:
 
         bar_h = 8
         bar_y0 = self.H - bar_h - 4
+        knob_w = 20
         d.rectangle((0, bar_y0, self.W, bar_y0 + bar_h), outline=0, fill=255)
-        d.rectangle((0, bar_y0, int(self.W * max(0.0, min(1.0, frac))), bar_y0 + bar_h), outline=0, fill=0)
+        x = int((self.W - knob_w) * max(0.0, min(1.0, frac)))
+        d.rectangle((x, bar_y0, x + knob_w, bar_y0 + bar_h), outline=0, fill=0)
 
         self._push_partial(img)
 
@@ -767,7 +791,7 @@ awaiting_expiry = False
 expiry_prompt_time = 0.0
 
 # Inventory browsing state
-INVENTORY_TIMEOUT_S = 10.0
+INVENTORY_TIMEOUT_S = 30.0
 inventory_mode = False
 inventory_rows = []
 inventory_idx = 0
@@ -913,13 +937,17 @@ try:
                     if inventory_rows:
                         inventory_idx = (inventory_idx - 1) % len(inventory_rows)
                         EPD_UI.clear_queue()
+                elif gesture == "SWIPE_DOWN":
                 else:
                     inventory_mode = False
                     EPD_UI.clear_queue()
                     EPD_UI.show_main()
                     return
+                else:
+                    return
                 item = inventory_rows[inventory_idx] if inventory_rows else None
-                EPD_UI.show_inventory(item, 1.0)
+                frac = (inventory_idx / (len(inventory_rows) - 1)) if len(inventory_rows) > 1 else 0.0
+                EPD_UI.show_inventory(item, frac)
                 inventory_last_draw = now
             else:
                 if gesture == "SWIPE_UP":
@@ -928,6 +956,9 @@ try:
                     inventory_last_gesture = now
                     inventory_mode = True
                     item = inventory_rows[inventory_idx] if inventory_rows else None
+                    frac = (inventory_idx / (len(inventory_rows) - 1)) if len(inventory_rows) > 1 else 0.0
+                    EPD_UI.clear_queue()
+                    EPD_UI.show_inventory(item, frac)
                     EPD_UI.clear_queue()
                     EPD_UI.show_inventory(item, 1.0)
                     inventory_last_draw = now
@@ -975,7 +1006,6 @@ try:
 
         if inventory_mode:
             remaining = max(0.0, INVENTORY_TIMEOUT_S - (now - inventory_last_gesture))
-            frac = remaining / INVENTORY_TIMEOUT_S
             if remaining <= 0:
                 inventory_mode = False
                 EPD_UI.clear_queue()
@@ -983,6 +1013,7 @@ try:
             elif (now - inventory_last_draw) > 0.5:
                 inventory_last_draw = now
                 item = inventory_rows[inventory_idx] if inventory_rows else None
+                frac = (inventory_idx / (len(inventory_rows) - 1)) if len(inventory_rows) > 1 else 0.0
                 EPD_UI.show_inventory(item, frac)
 
         # Expiration prompt timeout
