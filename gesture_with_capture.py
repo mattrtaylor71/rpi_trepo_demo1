@@ -427,7 +427,7 @@ HEADLESS = os.environ.get("DISPLAY", "") == ""
 CAPTURE_COOLDOWN_S = 2.5
 last_capture_t = 0.0
 countdown_last_sec = -1
-EXPIRY_WAIT_S = 5.0
+EXPIRY_WAIT_S = 8.0
 
 # Stability / thresholds
 WAIT_AFTER_SWIPE_S   = 1.0
@@ -862,7 +862,7 @@ try:
                                         print("[mode] captured; waiting for item removal to re-arm")
 
         # Re-arm when item is removed (center detail low for a few frames + min time)
-        if need_clear or awaiting_expiry:
+        if need_clear:
             lap_c = center_laplacian(bgr)
             clear_thr = max(PRESENCE_LAPLACE_MIN * 0.8, lap_thr_dyn * CLEAR_LAPLACE_FRAC)
             if lap_c < clear_thr:
@@ -872,25 +872,14 @@ try:
 
             ready_by_time = (now - last_capture_t) >= MIN_CLEAR_S
             if ready_by_time and clear_count >= CLEAR_WINDOW_FR:
-                if awaiting_expiry:
-                    awaiting_expiry = False
-                    armed = True
-                    arm_time = now
-                    countdown_last_sec = -1
-                    presence_dwell_start = None
-                    clear_count = 0
-                    print("[expiry] item removed; re-armed")
-                    if current_mode:
-                        EPD_UI.show_mode_prompt(current_mode, 1.0)
-                else:
-                    need_clear = False
-                    armed = True
-                    arm_time = now
-                    countdown_last_sec = -1
-                    presence_dwell_start = None
-                    print("[mode] scene cleared; re-armed")
-                    if current_mode:
-                        EPD_UI.show_mode_prompt(current_mode, 1.0)
+                need_clear = False
+                armed = True
+                arm_time = now
+                countdown_last_sec = -1
+                presence_dwell_start = None
+                print("[mode] scene cleared; re-armed")
+                if current_mode:
+                    EPD_UI.show_mode_prompt(current_mode, 1.0)
 
             cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
