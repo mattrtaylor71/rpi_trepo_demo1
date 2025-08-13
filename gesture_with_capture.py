@@ -345,18 +345,20 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 work_q = queue.Queue(maxsize=4)
 WORKER_ALIVE = False
-INVENTORY_CSV = "inventory.csv"
+# Separate CSV for storing item name embeddings to avoid clobbering
+# the main inventory CSV used elsewhere in this module.
+EMBEDDINGS_CSV = "embeddings.csv"
 
 def _append_embedding(name: str, emb):
-    os.makedirs(os.path.dirname(INVENTORY_CSV) or ".", exist_ok=True)
-    with open(INVENTORY_CSV, "a", newline="") as f:
+    os.makedirs(os.path.dirname(EMBEDDINGS_CSV) or ".", exist_ok=True)
+    with open(EMBEDDINGS_CSV, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([name, ",".join(str(x) for x in emb)])
 
 def _load_embeddings():
     rows = []
-    if os.path.exists(INVENTORY_CSV):
-        with open(INVENTORY_CSV, newline="") as f:
+    if os.path.exists(EMBEDDINGS_CSV):
+        with open(EMBEDDINGS_CSV, newline="") as f:
             for name, emb_str in csv.reader(f):
                 try:
                     emb = [float(x) for x in emb_str.split(",") if x]
@@ -366,7 +368,7 @@ def _load_embeddings():
     return rows
 
 def _save_embeddings(rows):
-    with open(INVENTORY_CSV, "w", newline="") as f:
+    with open(EMBEDDINGS_CSV, "w", newline="") as f:
         writer = csv.writer(f)
         for name, emb in rows:
             writer.writerow([name, ",".join(str(x) for x in emb)])
