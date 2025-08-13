@@ -440,10 +440,14 @@ last_capture_t = 0.0
 WAIT_AFTER_SWIPE_S   = 0.9
 STABILITY_WINDOW_FR  = 8
 MOTION_EMA_ALPHA     = 0.15
-MOTION_THR_SCALE     = 2.3
-MOTION_THR_FLOOR     = 0.004
-PRESENCE_LAPLACE_MIN = 28.0
-PRESENCE_LAPLACE_GAIN = 1.3
+
+PRESENCE_LAPLACE_MIN = 18.0          # was 28.0 — easier to satisfy in soft light
+PRESENCE_LAPLACE_GAIN = 1.20         # was 1.3 — less aggressive bump
+MAX_LAPLACE_THR = 85.0               # new: hard cap so threshold can't run away
+
+MOTION_THR_SCALE = 1.9               # was 2.3 — slightly easier to pass
+MOTION_THR_FLOOR = 0.004
+MAX_MOTION_THR   = 0.06              # new: don’t let dyn motion threshold exceed this
 
 ARM_TIMEOUT_S         = 8.0
 MOTION_EMA_ALPHA      = 0.25
@@ -598,19 +602,30 @@ FLIP_Y = False  # set True if up/down feel reversed
 def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
-    global need_clear
+    global need_clear, stable_since, confirm_left
+
     m = MODE_MAP.get(gesture)
-    if not m: return
+    if not m:
+        return
     current_mode = m
     armed = True
     need_clear = False
     arm_time = now_ts
     stable_count = 0
+    stable_since = None          # NEW: reset dwell timer
+    confirm_left = 0             # NEW: reset confirm counter
+
+    # Seed sharpness baseline + clamp
     if bgr_for_baseline is not None:
         lap = center_laplacian(bgr_for_baseline)
         lap_baseline = lap
         lap_thr_dyn  = max(PRESENCE_LAPLACE_MIN, lap * PRESENCE_LAPLACE_GAIN)
+        lap_thr_dyn  = min(lap_thr_dyn, MAX_LAPLACE_THR)  # NEW cap
+    else:
+        lap_thr_dyn = PRESENCE_LAPLACE_MIN
+
     print(f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f}  lap_thr={lap_thr_dyn:.1f}")
+
 
 try:
     while True:
@@ -725,10 +740,9 @@ try:
 
         def set_mode_and_seed(gesture: str):
             global motion_thr_dyn
-            motion_thr_dyn = max(
-                MOTION_THR_FLOOR,
-                (motion_ema or MOTION_THR_FLOOR) * MOTION_THR_SCALE
-            )
+            # use current ema if present; else floor
+            ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
+            motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))  # NEW cap
             set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
             EPD_UI.show_mode_prompt(current_mode)
             cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
@@ -786,9 +800,15 @@ try:
                 thr_enter = motion_thr_dyn * ENTER_RELAX
                 thr_exit  = motion_thr_dyn * EXIT_RELAX
 
-                below_enter = (motion_ema is not None) and (motion_ema < thr_enter)
-                above_exit  = (motion_ema is not None) and (motion_ema > thr_exit)
                 sharp_enough = (lap_c >= lap_thr_dyn)
+                below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
+                above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
+
+                # NEW: quick trace of the two gates
+                if int(time.time() * 5) % 5 == 0:  # ~5x/sec without spamming
+                    print(f"[stable?] motion_ema={motion_ema:.4f} thr={thr_enter:.4f} "
+                          f"lap={lap_c:.1f}/{lap_thr_dyn:.1f} ok_mo={below_enter} ok_sh={sharp_enough}")
+
 
                 if above_exit or not sharp_enough:
                     stable_count = 0
