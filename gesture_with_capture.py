@@ -427,7 +427,7 @@ HEADLESS = os.environ.get("DISPLAY", "") == ""
 CAPTURE_COOLDOWN_S = 2.5
 last_capture_t = 0.0
 countdown_last_sec = -1
-EXPIRY_TIMEOUT_S = 5.0
+EXPIRY_WAIT_S = 5.0
 
 # Stability / thresholds
 WAIT_AFTER_SWIPE_S   = 1.0
@@ -566,7 +566,6 @@ arm_time = 0.0
 stable_count = 0
 awaiting_expiry = False
 expiry_prompt_time = 0.0
-
 
 motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
@@ -746,7 +745,7 @@ try:
         # Armed: wait-for-stability
         # ---------------------------
         if armed:
-            total = EXPIRY_TIMEOUT_S if awaiting_expiry else ARM_TIMEOUT_S
+            total = EXPIRY_WAIT_S if awaiting_expiry else ARM_TIMEOUT_S
             remaining = max(0.0, total - (now - arm_time))
             if (now - last_capture_t) < CAPTURE_COOLDOWN_S:
                 stable_count = 0
