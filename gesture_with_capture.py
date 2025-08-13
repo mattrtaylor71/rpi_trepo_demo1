@@ -248,7 +248,13 @@ class EpaperUI:
 
     def _draw_mode(self, mode, frac):
         img, d = self._new_layer()
-        title = {"discard":"Discard","check_in":"Check-in","opened":"Opened","other":"Other"}.get(mode, mode or "--")
+        title = {
+            "discard": "Discard",
+            "check_in": "Check-in",
+            "opened": "Opened",
+            "other": "Other",
+            "expiry": "Checking expiry...",
+        }.get(mode, mode or "--")
         self._centered_text(d, 6, title, self.font_big)
         line1 = "hold items"
         line2 = "1–2ft away from camera"
@@ -421,7 +427,7 @@ HEADLESS = os.environ.get("DISPLAY", "") == ""
 CAPTURE_COOLDOWN_S = 2.5
 last_capture_t = 0.0
 countdown_last_sec = -1
-EXPIRY_WAIT_S     = 5.0
+EXPIRY_TIMEOUT_S = 5.0
 
 # Stability / thresholds
 WAIT_AFTER_SWIPE_S   = 1.0
@@ -559,7 +565,6 @@ armed = False
 arm_time = 0.0
 stable_count = 0
 awaiting_expiry = False
-expiry_prompt_time = 0.0
 
 motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
@@ -738,16 +743,31 @@ try:
         # Armed: wait-for-stability
         # ---------------------------
         if armed:
-            remaining = max(0.0, ARM_TIMEOUT_S - (now - arm_time))
+            total = EXPIRY_TIMEOUT_S if awaiting_expiry else ARM_TIMEOUT_S
+            remaining = max(0.0, total - (now - arm_time))
             if (now - last_capture_t) < CAPTURE_COOLDOWN_S:
                 stable_count = 0
                 presence_dwell_start = None
-            elif (now - arm_time) > ARM_TIMEOUT_S:
-                print("[mode] timeout; disarming without capture")
-                EPD_UI.show_timeout()
-                armed = False
-                presence_dwell_start = None
-                countdown_last_sec = -1
+            elif (now - arm_time) > total:
+                if awaiting_expiry:
+                    print("[expiry] timeout; awaiting item removal")
+                    awaiting_expiry = False
+                    need_clear = True
+                    armed = False
+                    clear_count = 0
+                    last_capture_t = now
+                    stable_count = 0
+                    stable_since = None
+                    confirm_left = 0
+                    presence_dwell_start = None
+                    countdown_last_sec = -1
+                    EPD_UI.show_captured("expiry", "NO EXPIRY", 1.0)
+                else:
+                    print("[mode] timeout; disarming without capture")
+                    EPD_UI.show_timeout()
+                    armed = False
+                    presence_dwell_start = None
+                    countdown_last_sec = -1
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
                 stable_count = 0
                 presence_dwell_start = None
@@ -757,7 +777,8 @@ try:
                     sec = int(remaining)
                     if sec != countdown_last_sec:
                         countdown_last_sec = sec
-                        EPD_UI.show_mode_prompt(current_mode, remaining / ARM_TIMEOUT_S)
+                        display_mode = "expiry" if awaiting_expiry else current_mode
+                        EPD_UI.show_mode_prompt(display_mode, remaining / total)
 
                 lap_c = center_laplacian(bgr)
                 thr_enter = motion_thr_dyn * ENTER_RELAX
@@ -825,13 +846,12 @@ try:
                                         print("[expiry] captured; waiting for item removal")
                                     elif tag == "check_in":
                                         awaiting_expiry = True
-                                        expiry_prompt_time = now
                                         armed = True
                                         need_clear = False
                                         clear_count = 0
                                         countdown_last_sec = -1
-                                        EPD_UI.show_expiry_prompt()
-                                        print("[expiry] prompt for expiration date")
+                                        EPD_UI.show_mode_prompt("expiry", 1.0)
+                                        print("[expiry] checking for expiration date")
                                     else:
                                         need_clear = True
                                         armed = False
