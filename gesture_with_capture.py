@@ -266,24 +266,6 @@ class EpaperUI:
         td.text((1, 1), label, font=self.font_sm, fill=0)
         timg = timg.rotate(90, expand=True)
         img.paste(timg, (inset, (self.H - timg.height) // 2))
-        # Left/right arrows near center but outside text
-        text_left = (self.W - tw) // 2
-        text_right = text_left + tw
-        gap = 10
-        left_x = text_left - s - gap
-        right_x = text_right + s + gap
-        self._arrow(d, x=left_x, y=mid_y, size=s, direction="left")
-        self._arrow(d, x=right_x, y=mid_y, size=s, direction="right")
-
-        # Vertical labels on edges
-        label = "Discard"
-        bbox = d.textbbox((0, 0), label, font=self.font_sm)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        timg = _Image.new('1', (tw, th), 255)
-        td = _Draw.Draw(timg)
-        td.text((0, 0), label, font=self.font_sm, fill=0)
-        timg = timg.rotate(90, expand=True)
-        img.paste(timg, (0, (self.H - timg.height) // 2))
 
         label = "Check-in"
         bbox = d.textbbox((0, 0), label, font=self.font_sm)
@@ -293,11 +275,6 @@ class EpaperUI:
         td.text((1, 1), label, font=self.font_sm, fill=0)
         timg = timg.rotate(270, expand=True)
         img.paste(timg, (self.W - timg.width - inset, (self.H - timg.height) // 2))
-        timg = _Image.new('1', (tw, th), 255)
-        td = _Draw.Draw(timg)
-        td.text((0, 0), label, font=self.font_sm, fill=0)
-        timg = timg.rotate(270, expand=True)
-        img.paste(timg, (self.W - timg.width, (self.H - timg.height) // 2))
 
         # Up arrow + label
         y = 10 + s
@@ -398,12 +375,6 @@ class EpaperUI:
             y += 16
             opened = item.get('opened_date') or "--"
             self._centered_text(d, y, f"opened: {opened}", self.font_sm)
-
-        # Scroll arrows
-        mid_y = self.H // 2
-        s = 8
-        self._arrow(d, x=3 + s, y=mid_y, size=s, direction="left")
-        self._arrow(d, x=self.W - 3 - s, y=mid_y, size=s, direction="right")
 
         # Scroll arrows
         mid_y = self.H // 2
@@ -938,7 +909,6 @@ try:
                         inventory_idx = (inventory_idx - 1) % len(inventory_rows)
                         EPD_UI.clear_queue()
                 elif gesture == "SWIPE_DOWN":
-                else:
                     inventory_mode = False
                     EPD_UI.clear_queue()
                     EPD_UI.show_main()
@@ -959,8 +929,6 @@ try:
                     frac = (inventory_idx / (len(inventory_rows) - 1)) if len(inventory_rows) > 1 else 0.0
                     EPD_UI.clear_queue()
                     EPD_UI.show_inventory(item, frac)
-                    EPD_UI.clear_queue()
-                    EPD_UI.show_inventory(item, 1.0)
                     inventory_last_draw = now
                     return
                 ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
