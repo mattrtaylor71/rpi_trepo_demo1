@@ -345,6 +345,37 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 work_q = queue.Queue(maxsize=4)
 WORKER_ALIVE = False
+INVENTORY_CSV = "inventory.csv"
+
+def _append_embedding(name: str, emb):
+    os.makedirs(os.path.dirname(INVENTORY_CSV) or ".", exist_ok=True)
+    with open(INVENTORY_CSV, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([name, ",".join(str(x) for x in emb)])
+
+def _load_embeddings():
+    rows = []
+    if os.path.exists(INVENTORY_CSV):
+        with open(INVENTORY_CSV, newline="") as f:
+            for name, emb_str in csv.reader(f):
+                try:
+                    emb = [float(x) for x in emb_str.split(",") if x]
+                    rows.append((name, emb))
+                except Exception:
+                    pass
+    return rows
+
+def _save_embeddings(rows):
+    with open(INVENTORY_CSV, "w", newline="") as f:
+        writer = csv.writer(f)
+        for name, emb in rows:
+            writer.writerow([name, ",".join(str(x) for x in emb)])
+
+def _cosine(a, b):
+    a = np.array(a)
+    b = np.array(b)
+    denom = (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+    return float(np.dot(a, b) / denom)
 pending_item = None
 
 def _parse_expiry_date(text: str):
@@ -414,6 +445,34 @@ def api_worker():
             dt_ms = (time.perf_counter() - t0) * 1000
             text = (resp.choices[0].message.content or "").strip()
             print(f"[OpenAI] ({tag}) {dt_ms:.0f} ms -> {text or '<empty>'}")
+            if text:
+                if tag == "check_in":
+                    try:
+                        emb = client.embeddings.create(model="text-embedding-3-small", input=text).data[0].embedding
+                        _append_embedding(text, emb)
+                        print(f"[embed] stored for '{text}'")
+                    except Exception as e:
+                        print(f"[embed][ERROR] {e}")
+                elif tag == "discard":
+                    try:
+                        new_emb = client.embeddings.create(model="text-embedding-3-small", input=text).data[0].embedding
+                        rows = _load_embeddings()
+                        if rows:
+                            sims = [_cosine(new_emb, emb) for _, emb in rows]
+                            idx = int(np.argmax(sims))
+                            best_sim = sims[idx]
+                            if best_sim >= 0.8:
+                                matched = rows[idx][0]
+                                print(f"[discard] matched '{matched}' ({best_sim:.2f})")
+                                # remove matched row
+                                del rows[idx]
+                                _save_embeddings(rows)
+                            else:
+                                print(f"[discard] no match above threshold ({best_sim:.2f})")
+                        else:
+                            print("[discard] inventory empty")
+                    except Exception as e:
+                        print(f"[discard][ERROR] {e}")
             if tag == "discard":
                 canonical_name = text
                 embedding = None
