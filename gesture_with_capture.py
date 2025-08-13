@@ -3,16 +3,15 @@ import numpy as np
 import cv2
 from picamera2 import Picamera2
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# EPAPER UI (2.13" tri-color V4). Non-blocking, background-rendered.
-# ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# EPAPER UI (2.13" tri-color V4) — no flash except when going to MAIN
+# EPAPER UI (2.13" mono B/W V4) — full refresh ONLY for “main”; partial elsewhere
 # ─────────────────────────────────────────────────────────────────────────────
 import threading as _thr
 from queue import Queue as _Q
 try:
-    from waveshare_epd import epd2in13b_V4 as _EPD
+    # ✅ Use the mono driver (not the tri-color one)
+    from waveshare_epd import epd2in13_V4 as _EPD
     from PIL import Image as _Image, ImageDraw as _Draw, ImageFont as _Font
 except Exception:
     _EPD = None
@@ -20,9 +19,10 @@ except Exception:
 
 class EpaperUI:
     """
-    - Full refresh ONLY for main screen (and on first boot).
-    - Mode + captured screens use partial refresh without re-init’ing each time.
-    - No `Clear()` outside of boot.
+    Mono 2.13" V4:
+      - Full refresh ONLY for main screen (and on first boot).
+      - Mode / Captured screens use PART_UPDATE via displayPartial() (no big flash).
+      - No Clear() after boot. No unnecessary re-inits (we track LUT mode).
     """
 
     def __init__(self):
@@ -33,41 +33,52 @@ class EpaperUI:
         self.q = _Q(maxsize=8)
         self.cur_mode = None
         self.last_screen = None
-        self.monochrome = True
 
-        # runtime state
-        self._partial_supported = False
-        self._lut = None              # 'full' | 'partial' | None
-        self.prevB = None
-        self.prevR = None
+        # runtime
+        self._lut = None             # 'full' | 'partial' | None
+        self.prev = None             # last pushed PIL image (mono)
+        self.rotate_deg = 0
+        self.rotate_180 = False
 
-        self._worker = _thr.Thread(target=self._run, daemon=True)
         if self.enabled:
+            self._worker = _thr.Thread(target=self._run, daemon=True)
             self._worker.start()
 
-    # PUBLIC API
+    # ── Public (non-blocking) ────────────────────────────────────────────────
     def show_main(self):            self._post(("main", None))
     def show_mode_prompt(self, m):  self.cur_mode = m; self._post(("mode", m))
     def show_captured(self, m, t):  self.cur_mode = m; self._post(("captured", (m, t)))
     def show_timeout(self):         self.cur_mode = None; self._post(("timeout", None))
 
-    # INTERNALS
+    # ── Internals ────────────────────────────────────────────────────────────
     def _post(self, msg):
         if not self.enabled: return
-        if msg == self.last_screen: return
+        if msg == self.last_screen: return  # coalesce duplicates
         try:
             self.q.put_nowait(msg)
             self.last_screen = msg
-        except: pass
+        except:
+            pass
 
     def _safe_init(self):
-        if self.epd is not None: return
+        if self.epd is not None:
+            return
         try:
             self.epd = _EPD.EPD()
-            self.epd.init()          # full LUT at boot
-            self.epd.Clear()         # ONLY here
 
-            # Panel coordinates
+            # FULL once at boot
+            if hasattr(self.epd, "FULL_UPDATE"):
+                self.epd.init(self.epd.FULL_UPDATE)
+            else:
+                self.epd.init()
+            # Clear ONLY here (use white)
+            try:
+                self.epd.Clear(0xFF)
+            except Exception:
+                pass
+            self._lut = 'full'
+
+            # geometry
             self.baseW, self.baseH = self.epd.width, self.epd.height
             if self.baseH > self.baseW:
                 self.W, self.H = self.baseH, self.baseW
@@ -90,16 +101,6 @@ class EpaperUI:
                 self.font_md  = _Font.truetype(f, 18)
                 self.font_sm  = _Font.truetype(f, 14)
 
-            # detect partial support once
-            self._partial_supported = any([
-                hasattr(self.epd, "displayPartial"),
-                hasattr(self.epd, "display_Partial"),
-                hasattr(self.epd, "DisplayPartial"),
-                hasattr(self.epd, "init_fast"),
-                hasattr(self.epd, "Init_Partial"),
-                hasattr(self.epd, "init_Partial"),
-            ])
-            self._lut = 'full'  # we just did a full init
         except Exception as e:
             print(f"[EPD] init failed: {e}")
             self.enabled = False
@@ -111,44 +112,41 @@ class EpaperUI:
                 self._safe_init()
                 if not self.enabled:
                     continue
+
                 kind, payload = msg
-                if kind == "main":
-                    self._draw_main()       # FULL
-                elif kind == "mode":
-                    self._draw_mode(payload)  # PARTIAL
+                if kind == "main":            self._draw_main()       # FULL
+                elif kind == "mode":          self._draw_mode(payload) # PARTIAL
                 elif kind == "captured":
                     m, ok = payload
-                    self._draw_captured(m, ok)   # PARTIAL
-                elif kind == "timeout":
-                    self._draw_main()       # FULL
+                    self._draw_captured(m, ok)                        # PARTIAL
+                elif kind == "timeout":       self._draw_main()       # FULL
             except Exception as e:
                 print(f"[EPD] worker error: {e}")
             finally:
                 self.q.task_done()
 
-    # DRAW HELPERS
-    def _new_layers(self):
-        black = _Image.new('1', (self.W, self.H), 255)
-        red   = _Image.new('1', (self.W, self.H), 255)
-        db = _Draw.Draw(black)
-        dr = db if getattr(self, "monochrome", False) else _Draw.Draw(red)
-        return black, red, db, dr
+    # ── Low-level helpers ───────────────────────────────────────────────────
+    def _new_layer(self):
+        img = _Image.new('1', (self.W, self.H), 255)     # 1-bit white
+        d   = _Draw.Draw(img)
+        return img, d
 
-    def _rotate_for_panel(self, img):
-        img_out = img
-        if getattr(self, "rotate_deg", 0) in (90, 270):
-            img_out = img_out.rotate(self.rotate_deg, expand=True)
-        elif getattr(self, "rotate_deg", 0) == 180:
-            img_out = img_out.rotate(180)
-        if getattr(self, "rotate_180", False):
-            img_out = img_out.rotate(180)
-        return img_out
+    def _rotate(self, img):
+        if self.rotate_deg in (90, 270):
+            img = img.rotate(self.rotate_deg, expand=True)
+        elif self.rotate_deg == 180:
+            img = img.rotate(180)
+        if self.rotate_180:
+            img = img.rotate(180)
+        return img
 
-    # LUT mode switchers — never re-init more than necessary
     def _enter_full(self):
         if self._lut == 'full': return
         try:
-            self.epd.init()
+            if hasattr(self.epd, "FULL_UPDATE"):
+                self.epd.init(self.epd.FULL_UPDATE)
+            else:
+                self.epd.init()
             self._lut = 'full'
         except Exception as e:
             print(f"[EPD] enter_full failed: {e}")
@@ -156,110 +154,112 @@ class EpaperUI:
     def _enter_partial(self):
         if self._lut == 'partial': return
         try:
-            if   hasattr(self.epd, "init_fast"):     self.epd.init_fast()
-            elif hasattr(self.epd, "Init_Partial"):  self.epd.Init_Partial()
-            elif hasattr(self.epd, "init_Partial"):  self.epd.init_Partial()
-            else:                                    self.epd.init()  # fallback
+            if hasattr(self.epd, "PART_UPDATE"):
+                self.epd.init(self.epd.PART_UPDATE)
+            else:
+                # Some forks expose init_fast(); fall back if present
+                if hasattr(self.epd, "init_fast"):
+                    self.epd.init_fast()
+                else:
+                    self.epd.init()
             self._lut = 'partial'
         except Exception as e:
             print(f"[EPD] enter_partial failed: {e}")
 
-    def _buffers_equal(self, a, b):
-        if a is None or b is None: return False
-        try:
-            return a.tobytes() == b.tobytes()
-        except Exception:
-            return False
+    def _buf(self, img):
+        # Waveshare expects a packed buffer from a PIL 1-bit image.
+        return self.epd.getbuffer(img)
 
-    def _push_full(self, black, red):
+    # IMPORTANT: Full refresh ONLY here. Also primes partial base image.
+    def _push_full_then_prime_partial(self, img):
         self._enter_full()
-        imgB = self._rotate_for_panel(black)
-        imgR = self._rotate_for_panel(red)
-        # Skip if identical (rare for main, but cheap)
-        if self._buffers_equal(imgB, self.prevB) and self._buffers_equal(imgR, self.prevR):
-            return
-        try:
-            self.epd.display(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
-        except TypeError:
-            self.epd.display(self.epd.getbuffer(imgB))
-        self.prevB, self.prevR = imgB, imgR
+        out = self._rotate(img)
 
-    def _push_partial(self, black, red):
+        # Full-screen draw (this is where the flash happens)
+        self.epd.display(self._buf(out))
+
+        # Immediately switch to partial mode and set base image
         self._enter_partial()
-        imgB = self._rotate_for_panel(black)
-        imgR = self._rotate_for_panel(red)
-        if self._buffers_equal(imgB, self.prevB) and self._buffers_equal(imgR, self.prevR):
-            return  # no-op; avoid any flash
-
-        pushed = False
         try:
-            if   hasattr(self.epd, "displayPartial"):
-                try:
-                    self.epd.displayPartial(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
-                except TypeError:
-                    self.epd.displayPartial(self.epd.getbuffer(imgB))
-                pushed = True
-            elif hasattr(self.epd, "display_Partial"):
-                self.epd.display_Partial(self.epd.getbuffer(imgB))
-                pushed = True
-            elif hasattr(self.epd, "DisplayPartial"):
-                self.epd.DisplayPartial(self.epd.getbuffer(imgB))
-                pushed = True
-        except Exception as e:
-            print(f"[EPD] displayPartial failed: {e}")
+            # Required on mono V4 to enable clean partials
+            self.epd.displayPartBaseImage(self._buf(out))
+        except Exception:
+            # Some forks don't require/offer this; safe to ignore.
+            pass
 
-        if not pushed:
-            # Fallback: regular display WITHOUT Clear() and WITHOUT LUT re-init.
+        self.prev = out
+
+    # Partial draw: no full flash
+    def _push_partial(self, img):
+        out = self._rotate(img)
+        if self.prev is not None:
             try:
-                self.epd.display(self.epd.getbuffer(imgB), self.epd.getbuffer(imgR))
-            except TypeError:
-                self.epd.display(self.epd.getbuffer(imgB))
+                if out.tobytes() == self.prev.tobytes():
+                    return  # nothing changed
+            except Exception:
+                pass
 
-        self.prevB, self.prevR = imgB, imgR
+        self._enter_partial()
+        try:
+            self.epd.displayPartial(self._buf(out))
+        except AttributeError:
+            # Fallback if method name differs; should still be partial LUT
+            self.epd.display(self._buf(out))
+        self.prev = out
 
-    # SCREENS
+    # ── Screens ──────────────────────────────────────────────────────────────
     def _draw_main(self):
-        b, r, db, dr = self._new_layers()
-        db.text((8, 8), "Swipe to choose mode", font=self.font_md, fill=0)
-        y = int(self.H * 0.60); arrow_sz = 20
-        self._arrow(db, x=int(self.W * 0.30), y=y, size=arrow_sz, direction="left")
-        db.text((int(self.W * 0.24), y + 18), "discard", font=self.font_sm, fill=0)
-        self._arrow(dr, x=int(self.W * 0.70), y=y, size=arrow_sz, direction="right")
-        dr.text((int(self.W * 0.64), y + 18), "check-in", font=self.font_sm, fill=0)
-        db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
-        self._push_full(b, r)  # <- full refresh only here
+        img, d = self._new_layer()
+        d.text((8, 8), "Swipe to choose mode", font=self.font_md, fill=0)
+
+        y = int(self.H * 0.60); s = 20
+        self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
+        d.text((int(self.W * 0.24), y + 18), "discard", font=self.font_sm, fill=0)
+        self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
+        d.text((int(self.W * 0.64), y + 18), "check-in", font=self.font_sm, fill=0)
+        d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
+
+        # Full refresh, then immediately prime partial mode for next screens
+        self._push_full_then_prime_partial(img)
 
     def _draw_mode(self, mode):
-        b, r, db, dr = self._new_layers()
+        img, d = self._new_layer()
         title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
-        db.text((8, 8), title, font=self.font_big, fill=0)
+        d.text((8, 8), title, font=self.font_big, fill=0)
+
         prompt = "Hold item still ~1ft from camera"
-        (dr if mode == "check_in" else db).text((8, 36), prompt, font=self.font_md, fill=0)
-        y = int(self.H * 0.60); arrow_sz = 20
+        d.text((8, 36), prompt, font=self.font_md, fill=0)
+
+        y = int(self.H * 0.60); s = 20
         if mode == "discard":
-            self._arrow(db, x=int(self.W * 0.30), y=y, size=arrow_sz, direction="left")
+            self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
         elif mode == "check_in":
-            self._arrow(dr, x=int(self.W * 0.70), y=y, size=arrow_sz, direction="right")
+            self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
         else:
-            db.rectangle((int(self.W*0.45), y-10, int(self.W*0.55), y+10), outline=0, width=2)
-        db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
-        self._push_partial(b, r)  # <- partial (no flash)
+            d.rectangle((int(self.W*0.45), y-10, int(self.W*0.55), y+10), outline=0, width=2)
+
+        d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
+        self._push_partial(img)
 
     def _draw_captured(self, mode, ok_text):
-        b, r, db, dr = self._new_layers()
+        img, d = self._new_layer()
         title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
-        db.text((8, 8), title, font=self.font_big, fill=0)
+        d.text((8, 8), title, font=self.font_big, fill=0)
+
         x0, y0, x1, y1 = 8, 36, self.W - 8, 76
-        dr.rectangle((x0, y0, x1, y1), outline=0, fill=255)
-        dr.text((x0 + 10, y0 + 6), ok_text, font=self.font_md, fill=0)
-        db.text((8, 84), "Hold item still ~1ft from camera", font=self.font_md, fill=0)
-        y = int(self.H * 0.60); arrow_sz = 20
+        d.rectangle((x0, y0, x1, y1), outline=0, fill=255)   # white box, then invert text by drawing black
+        d.text((x0 + 10, y0 + 6), ok_text, font=self.font_md, fill=0)
+
+        d.text((8, 84), "Hold item still ~1ft from camera", font=self.font_md, fill=0)
+
+        y = int(self.H * 0.60); s = 20
         if mode == "discard":
-            self._arrow(db, x=int(self.W * 0.30), y=y, size=arrow_sz, direction="left")
+            self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
         elif mode == "check_in":
-            self._arrow(dr, x=int(self.W * 0.70), y=y, size=arrow_sz, direction="right")
-        db.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
-        self._push_partial(b, r)  # <- partial (no flash)
+            self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
+
+        d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
+        self._push_partial(img)
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
         s = size
