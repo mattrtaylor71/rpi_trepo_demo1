@@ -50,8 +50,8 @@ class EpaperUI:
     def show_timeout(self):
         self.cur_mode = None
         self._post(("timeout", None))
-    def show_inventory(self, rows):
-        self._post(("inventory", rows))
+    def show_inventory(self, item, frac=1.0):
+        self._post(("inventory", (item, frac)))
 
     # Internals
     def _post(self, msg):
@@ -235,30 +235,41 @@ class EpaperUI:
     # Screens
     def _draw_main(self):
         img, d = self._new_layer()
-        self._centered_text(d, 6, "Swipe to choose mode", self.font_md)
-        s = 20
-        mid_x = self.W // 2
-        y = int(self.H * 0.60)
-        left_x = int(self.W * 0.30)
-        right_x = int(self.W * 0.70)
-        self._arrow(d, x=left_x, y=y, size=s, direction="left")
-        bbox = d.textbbox((0, 0), "Discard", font=self.font_sm)
+        bbox = d.textbbox((0, 0), "swipe", font=self.font_big)
         tw = bbox[2] - bbox[0]
-        d.text((left_x - tw // 2, y + 18), "Discard", font=self.font_sm, fill=0)
-        self._arrow(d, x=right_x, y=y, size=s, direction="right")
+        th = bbox[3] - bbox[1]
+        self._centered_text(d, (self.H - th) // 2, "swipe", self.font_big)
+
+        s = 14
+        mid_x = self.W // 2
+        mid_y = self.H // 2
+
+        # Left arrow + label
+        x = 10 + s
+        self._arrow(d, x=x, y=mid_y, size=s, direction="left")
+        d.text((x + s + 4, mid_y - 7), "Discard", font=self.font_sm, fill=0)
+
+        # Right arrow + label
+        x = self.W - 10 - s
+        self._arrow(d, x=x, y=mid_y, size=s, direction="right")
         bbox = d.textbbox((0, 0), "Check-in", font=self.font_sm)
         tw = bbox[2] - bbox[0]
-        d.text((right_x - tw // 2, y + 18), "Check-in", font=self.font_sm, fill=0)
-        up_y = int(self.H * 0.25)
-        self._arrow(d, x=mid_x, y=up_y, size=s, direction="up")
+        d.text((x - s - 4 - tw, mid_y - 7), "Check-in", font=self.font_sm, fill=0)
+
+        # Up arrow + label
+        y = 10 + s
+        self._arrow(d, x=mid_x, y=y, size=s, direction="up")
         bbox = d.textbbox((0, 0), "Inventory", font=self.font_sm)
         tw = bbox[2] - bbox[0]
-        d.text((mid_x - tw // 2, up_y - s - 10), "Inventory", font=self.font_sm, fill=0)
-        down_y = int(self.H * 0.85)
-        self._arrow(d, x=mid_x, y=down_y, size=s, direction="down")
+        d.text((mid_x - tw // 2, y - s - 12), "Inventory", font=self.font_sm, fill=0)
+
+        # Down arrow + label
+        y = self.H - 10 - s
+        self._arrow(d, x=mid_x, y=y, size=s, direction="down")
         bbox = d.textbbox((0, 0), "Opened", font=self.font_sm)
         tw = bbox[2] - bbox[0]
-        d.text((mid_x - tw // 2, down_y + s + 2), "Opened", font=self.font_sm, fill=0)
+        d.text((mid_x - tw // 2, y + s + 4), "Opened", font=self.font_sm, fill=0)
+
         self._push_partial(img)
 
     def _draw_mode(self, mode, frac):
@@ -312,19 +323,44 @@ class EpaperUI:
         self._centered_text(d, 6, "Log expiration date?", self.font_md)
         self._push_partial(img)
 
-    def _draw_inventory(self, rows):
+    def _wrap_lines(self, d, text, font, max_width, max_lines=2):
+        words = text.split()
+        lines, line = [], ""
+        for w in words:
+            test = w if not line else line + " " + w
+            if d.textbbox((0, 0), test, font=font)[2] <= max_width:
+                line = test
+            else:
+                lines.append(line)
+                line = w
+                if len(lines) >= max_lines - 1:
+                    break
+        if line:
+            lines.append(line)
+        return lines[:max_lines]
+
+    def _draw_inventory(self, payload):
+        item, frac = payload
         img, d = self._new_layer()
-        if not rows:
+        if not item:
             self._centered_text(d, 6, "Inventory empty", self.font_md)
         else:
             y = 6
-            line_h = 16
-            for r in rows:
-                text = f"{r['name']} - {r['expiry']} ({r['state']})"
-                d.text((2, y), text, font=self.font_sm, fill=0)
-                y += line_h
-                if y > self.H - line_h:
-                    break
+            lines = self._wrap_lines(d, item.get("name", ""), self.font_md, self.W - 4, 2)
+            for line in lines:
+                d.text((2, y), line, font=self.font_md, fill=0)
+                y += 18
+            y += 4
+            d.text((2, y), f"expiry: {item.get('expiry', '')}", font=self.font_sm, fill=0)
+            y += 16
+            opened = item.get('opened_date') or "--"
+            d.text((2, y), f"opened: {opened}", font=self.font_sm, fill=0)
+
+        bar_h = 8
+        bar_y0 = self.H - bar_h - 4
+        d.rectangle((0, bar_y0, self.W, bar_y0 + bar_h), outline=0, fill=255)
+        d.rectangle((0, bar_y0, int(self.W * max(0.0, min(1.0, frac))), bar_y0 + bar_h), outline=0, fill=0)
+
         self._push_partial(img)
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
@@ -697,6 +733,14 @@ stable_count = 0
 awaiting_expiry = False
 expiry_prompt_time = 0.0
 
+# Inventory browsing state
+INVENTORY_TIMEOUT_S = 10.0
+inventory_mode = False
+inventory_rows = []
+inventory_idx = 0
+inventory_last_gesture = 0.0
+inventory_last_draw = 0.0
+
 motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
 lap_baseline = 0.0
@@ -823,16 +867,39 @@ try:
         gesture_text = ""
         can_fire = (now - last_fire) > COOLDOWN_S
 
-        def set_mode_and_seed(gesture: str):
-            global motion_thr_dyn
-            if gesture == "SWIPE_UP":
-                EPD_UI.show_inventory(load_inventory())
-                return
-            ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
-            motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))
-            set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
-            EPD_UI.show_mode_prompt(current_mode, 1.0)
-            cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        def handle_gesture(gesture: str):
+            global motion_thr_dyn, inventory_mode, inventory_rows, inventory_idx
+            global inventory_last_gesture, inventory_last_draw
+            if inventory_mode:
+                inventory_last_gesture = now
+                if gesture == "SWIPE_LEFT":
+                    if inventory_rows:
+                        inventory_idx = (inventory_idx + 1) % len(inventory_rows)
+                elif gesture == "SWIPE_RIGHT":
+                    if inventory_rows:
+                        inventory_idx = (inventory_idx - 1) % len(inventory_rows)
+                else:
+                    inventory_mode = False
+                    EPD_UI.show_main()
+                    return
+                item = inventory_rows[inventory_idx] if inventory_rows else None
+                EPD_UI.show_inventory(item, 1.0)
+                inventory_last_draw = now
+            else:
+                if gesture == "SWIPE_UP":
+                    inventory_rows = load_inventory()
+                    inventory_idx = 0
+                    inventory_last_gesture = now
+                    inventory_mode = True
+                    item = inventory_rows[inventory_idx] if inventory_rows else None
+                    EPD_UI.show_inventory(item, 1.0)
+                    inventory_last_draw = now
+                    return
+                ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
+                motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))
+                set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
+                EPD_UI.show_mode_prompt(current_mode, 1.0)
+                cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
         if x_norm is not None:
             if state_x == "IDLE":
@@ -841,10 +908,10 @@ try:
             if can_fire:
                 if state_x == "ARM_RIGHT" and x_norm >= R_FIRE:
                     gesture_text = "SWIPE_RIGHT"; last_fire = now; state_x = "IDLE"; trace_x.clear()
-                    print("SWIPE_RIGHT"); set_mode_and_seed("SWIPE_RIGHT")
+                    print("SWIPE_RIGHT"); handle_gesture("SWIPE_RIGHT")
                 elif state_x == "ARM_LEFT" and x_norm <= L_FIRE:
                     gesture_text = "SWIPE_LEFT";  last_fire = now; state_x = "IDLE"; trace_x.clear()
-                    print("SWIPE_LEFT");  set_mode_and_seed("SWIPE_LEFT")
+                    print("SWIPE_LEFT");  handle_gesture("SWIPE_LEFT")
         else:
             if state_x != "IDLE" and (now - last_seen_t_x) > ABSENCE_RESET_S: state_x = "IDLE"
 
@@ -855,19 +922,30 @@ try:
             if can_fire:
                 if state_y == "ARM_DOWN" and y_norm >= B_FIRE:
                     gesture_text = "SWIPE_DOWN"; last_fire = now; state_y = "IDLE"; trace_y.clear()
-                    print("SWIPE_DOWN"); set_mode_and_seed("SWIPE_DOWN")
+                    print("SWIPE_DOWN"); handle_gesture("SWIPE_DOWN")
                 elif state_y == "ARM_UP" and y_norm <= T_FIRE:
                     gesture_text = "SWIPE_UP";   last_fire = now; state_y = "IDLE"; trace_y.clear()
-                    print("SWIPE_UP");   set_mode_and_seed("SWIPE_UP")
+                    print("SWIPE_UP");   handle_gesture("SWIPE_UP")
         else:
             if state_y != "IDLE" and (now - last_seen_t_y) > ABSENCE_RESET_S: state_y = "IDLE"
 
         if can_fire and gesture_text == "" and span_x >= SPAN_THR_X and abs(vel_x) >= VEL_THR_X:
             g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
-            print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
+            print(f"{g} (span/vel)"); handle_gesture(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
         if can_fire and gesture_text == "" and span_y >= SPAN_THR_Y and abs(vel_y) >= VEL_THR_Y:
             g = "SWIPE_DOWN" if vel_y > 0 else "SWIPE_UP"
-            print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_y = "IDLE"; trace_y.clear()
+            print(f"{g} (span/vel)"); handle_gesture(g); last_fire = now; state_y = "IDLE"; trace_y.clear()
+
+        if inventory_mode:
+            remaining = max(0.0, INVENTORY_TIMEOUT_S - (now - inventory_last_gesture))
+            frac = remaining / INVENTORY_TIMEOUT_S
+            if remaining <= 0:
+                inventory_mode = False
+                EPD_UI.show_main()
+            elif (now - inventory_last_draw) > 0.5:
+                inventory_last_draw = now
+                item = inventory_rows[inventory_idx] if inventory_rows else None
+                EPD_UI.show_inventory(item, frac)
 
         # Expiration prompt timeout
         if awaiting_expiry and (now - expiry_prompt_time) > EXPIRY_WAIT_S:
