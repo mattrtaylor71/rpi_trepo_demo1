@@ -1051,6 +1051,7 @@ try:
                 else:
                     presence_dwell_start = None
 
+
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
                     print(f"[stable?] mo={motion_ema:.4f} < {thr_enter:.4f} lap={lap_c:.1f} >= {lap_thr_dyn+LAPLACE_MARGIN:.1f} "
