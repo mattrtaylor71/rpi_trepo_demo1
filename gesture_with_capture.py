@@ -638,6 +638,7 @@ CONFIRM_FR       = 2
 stable_since = None
 confirm_left = 0
 presence_dwell_start = None
+motion_since_arm = False
 
 CLEAR_LAPLACE_FRAC = 0.75
 CLEAR_WINDOW_FR    = 10
@@ -770,6 +771,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
     global need_clear, stable_since, confirm_left, presence_dwell_start
+    global motion_since_arm
     global countdown_last_sec, awaiting_expiry, expiry_prompt_time
 
     m = MODE_MAP.get(gesture)
@@ -785,6 +787,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     stable_since = None
     confirm_left = 0
     presence_dwell_start = None
+    motion_since_arm = False
 
     if bgr_for_baseline is not None:
         lap_baseline = center_laplacian(bgr_for_baseline)
@@ -1002,6 +1005,7 @@ try:
                     stable_since = None
                     confirm_left = 0
                     presence_dwell_start = None
+                    motion_since_arm = False
                     countdown_last_sec = -1
                     EPD_UI.show_captured("expiry", "NO EXPIRY", 1.0)
                 else:
@@ -1009,6 +1013,7 @@ try:
                     EPD_UI.show_timeout()
                     armed = False
                     presence_dwell_start = None
+                    motion_since_arm = False
                     countdown_last_sec = -1
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
                 stable_count = 0
@@ -1031,17 +1036,21 @@ try:
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
+                if above_exit:
+                    motion_since_arm = True
+
                 # Safety valve (optional): very steady for a while → let sharpness slide
                 if (not sharp_enough) and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
                     sharp_enough = True
                     print("[stable?] overriding sharpness due to sustained steadiness")
 
-                # Presence dwell: start timing only when BOTH gates are met
-                if below_enter and sharp_enough:
+                # Presence dwell: require motion since arming and both gates
+                if motion_since_arm and below_enter and sharp_enough:
                     if presence_dwell_start is None:
                         presence_dwell_start = now
                 else:
                     presence_dwell_start = None
+
 
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
@@ -1081,6 +1090,7 @@ try:
                                     stable_count = 0
                                     stable_since = None
                                     presence_dwell_start = None
+                                    motion_since_arm = False
                                     if awaiting_expiry:
                                         awaiting_expiry = False
                                         need_clear = True
@@ -1118,6 +1128,7 @@ try:
                 arm_time = now
                 countdown_last_sec = -1
                 presence_dwell_start = None
+                motion_since_arm = False
                 print("[mode] scene cleared; re-armed")
                 if current_mode:
                     EPD_UI.show_mode_prompt(current_mode, 1.0)
