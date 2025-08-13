@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 from pathlib import Path
 from picamera2 import Picamera2
+from inventory import add_inventory_item
 
 INVENTORY_CSV = Path('/home/pi/fridge_inventory.csv')
 
@@ -343,9 +344,33 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 work_q = queue.Queue(maxsize=4)
 WORKER_ALIVE = False
+pending_item = None
+
+def _parse_expiry_date(text: str):
+    text = text.strip()
+    fmts = [
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%d %b %Y",
+        "%b %d %Y",
+        "%d %B %Y",
+        "%B %d %Y",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d %b %y",
+        "%b %d %y",
+    ]
+    for fmt in fmts:
+        try:
+            dt = datetime.datetime.strptime(text, fmt)
+            return int(dt.timestamp())
+        except Exception:
+            continue
+    return None
 
 def api_worker():
-    global WORKER_ALIVE
+    global WORKER_ALIVE, pending_item
     if OpenAI is None:
         print("[OpenAI] Worker not started: openai SDK not importable."); return
     if not OPENAI_API_KEY:
@@ -388,6 +413,32 @@ def api_worker():
             dt_ms = (time.perf_counter() - t0) * 1000
             text = (resp.choices[0].message.content or "").strip()
             print(f"[OpenAI] ({tag}) {dt_ms:.0f} ms -> {text or '<empty>'}")
+
+            if tag == "check_in":
+                canonical = text.lower()
+                display = text
+                embedding = []
+                try:
+                    emb = client.embeddings.create(model="text-embedding-3-small", input=canonical)
+                    embedding = emb.data[0].embedding
+                except Exception as e:
+                    print(f"[OpenAI] embedding failed: {e}")
+                pending_item = {
+                    "canonical_name": canonical,
+                    "display_name": display,
+                    "embedding": embedding,
+                }
+            elif tag == "expiry":
+                expiry_ts = _parse_expiry_date(text)
+                if pending_item and expiry_ts is not None:
+                    add_inventory_item(
+                        pending_item["canonical_name"],
+                        pending_item["display_name"],
+                        expiry_ts,
+                        pending_item["embedding"],
+                    )
+                    print(f"[inventory] added {pending_item['display_name']} exp={expiry_ts}")
+                    pending_item = None
         except Exception as e:
             print(f"[OpenAI ERROR] tag='{tag}': {type(e).__name__}: {e}")
         finally:
