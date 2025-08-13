@@ -39,9 +39,15 @@ class EpaperUI:
 
     # Public
     def show_main(self):            self._post(("main", None))
-    def show_mode_prompt(self, m):  self.cur_mode = m; self._post(("mode", m))
-    def show_captured(self, m, t):  self.cur_mode = m; self._post(("captured", (m, t)))
-    def show_timeout(self):         self.cur_mode = None; self._post(("timeout", None))
+    def show_mode_prompt(self, m, frac=1.0):
+        self.cur_mode = m
+        self._post(("mode", (m, frac)))
+    def show_captured(self, m, t, frac=1.0):
+        self.cur_mode = m
+        self._post(("captured", (m, t, frac)))
+    def show_timeout(self):
+        self.cur_mode = None
+        self._post(("timeout", None))
 
     # Internals
     def _post(self, msg):
@@ -126,10 +132,12 @@ class EpaperUI:
 
                 kind, payload = msg
                 if kind == "main":            self._draw_main()
-                elif kind == "mode":          self._draw_mode(payload)
+                elif kind == "mode":
+                    m, frac = payload
+                    self._draw_mode(m, frac)
                 elif kind == "captured":
-                    m, ok = payload
-                    self._draw_captured(m, ok)
+                    m, ok, frac = payload
+                    self._draw_captured(m, ok, frac)
                 elif kind == "timeout":       self._draw_main()
             except Exception as e:
                 print(f"[EPD] worker error: {e}")
@@ -226,18 +234,18 @@ class EpaperUI:
         left_x = int(self.W * 0.30)
         right_x = int(self.W * 0.70)
         self._arrow(d, x=left_x, y=y, size=s, direction="left")
-        bbox = d.textbbox((0, 0), "discard", font=self.font_sm)
+        bbox = d.textbbox((0, 0), "Discard", font=self.font_sm)
         tw = bbox[2] - bbox[0]
-        d.text((left_x - tw // 2, y + 18), "discard", font=self.font_sm, fill=0)
+        d.text((left_x - tw // 2, y + 18), "Discard", font=self.font_sm, fill=0)
         self._arrow(d, x=right_x, y=y, size=s, direction="right")
-        bbox = d.textbbox((0, 0), "check-in", font=self.font_sm)
+        bbox = d.textbbox((0, 0), "Check-in", font=self.font_sm)
         tw = bbox[2] - bbox[0]
-        d.text((right_x - tw // 2, y + 18), "check-in", font=self.font_sm, fill=0)
+        d.text((right_x - tw // 2, y + 18), "Check-in", font=self.font_sm, fill=0)
         self._push_partial(img)
 
-    def _draw_mode(self, mode):
+    def _draw_mode(self, mode, frac):
         img, d = self._new_layer()
-        title = {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
+        title = {"discard":"Discard","check_in":"Check-in","opened":"Opened","other":"Other"}.get(mode, mode or "--")
         self._centered_text(d, 6, title, self.font_big)
         line1 = "hold items"
         line2 = "1–2ft away from camera"
@@ -250,15 +258,37 @@ class EpaperUI:
         y0 = (self.H - total_h) // 2
         d.text(((self.W - tw1) // 2, y0), line1, font=self.font_italic, fill=0)
         d.text(((self.W - tw2) // 2, y0 + th1 + gap), line2, font=self.font_italic, fill=0)
+
+        # countdown bar
+        bar_h = 8
+        bar_y0 = self.H - bar_h - 4
+        d.rectangle((0, bar_y0, self.W, bar_y0 + bar_h), outline=0, fill=255)
+        d.rectangle((0, bar_y0, int(self.W * max(0.0, min(1.0, frac))), bar_y0 + bar_h), outline=0, fill=0)
+
         self._push_partial(img)
 
-    def _draw_captured(self, mode, ok_text):
+    def _draw_captured(self, mode, ok_text, frac):
         img, d = self._new_layer()
         banner = ok_text.strip()
         bbox = d.textbbox((0, 0), banner, font=self.font_big)
         tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
         x = (self.W - tw)//2; y = (self.H - th)//2
+
+        pad = 6
+        d.rectangle((x - pad, y - pad, x + tw + pad, y + th + pad), outline=0, fill=255)
         d.text((x, y), banner, font=self.font_big, fill=0)
+
+        # celebratory rays
+        cx = self.W // 2
+        for dx in (-25, 0, 25):
+            d.line((cx + dx, y - 18, cx + dx, y - 4), fill=0, width=2)
+
+        # countdown bar
+        bar_h = 8
+        bar_y0 = self.H - bar_h - 4
+        d.rectangle((0, bar_y0, self.W, bar_y0 + bar_h), outline=0, fill=255)
+        d.rectangle((0, bar_y0, int(self.W * max(0.0, min(1.0, frac))), bar_y0 + bar_h), outline=0, fill=0)
+
         self._push_partial(img)
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
@@ -383,6 +413,7 @@ HEADLESS = os.environ.get("DISPLAY", "") == ""
 
 CAPTURE_COOLDOWN_S = 2.5
 last_capture_t = 0.0
+countdown_last_sec = -1
 
 # Stability / thresholds
 WAIT_AFTER_SWIPE_S   = 1.0
@@ -532,6 +563,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
     global need_clear, stable_since, confirm_left, presence_dwell_start
+    global countdown_last_sec
 
     m = MODE_MAP.get(gesture)
     if not m: return
@@ -539,6 +571,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     armed = True
     need_clear = False
     arm_time = now_ts
+    countdown_last_sec = -1
     stable_count = 0
     stable_since = None
     confirm_left = 0
@@ -647,7 +680,7 @@ try:
             ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
             motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))
             set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
-            EPD_UI.show_mode_prompt(current_mode)
+            EPD_UI.show_mode_prompt(current_mode, 1.0)
             cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
         if x_norm is not None:
@@ -686,6 +719,7 @@ try:
         # Armed: wait-for-stability
         # ---------------------------
         if armed:
+            remaining = max(0.0, ARM_TIMEOUT_S - (now - arm_time))
             if (now - last_capture_t) < CAPTURE_COOLDOWN_S:
                 stable_count = 0
                 presence_dwell_start = None
@@ -694,10 +728,18 @@ try:
                 EPD_UI.show_timeout()
                 armed = False
                 presence_dwell_start = None
+                countdown_last_sec = -1
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
                 stable_count = 0
                 presence_dwell_start = None
             else:
+                # update countdown bar roughly each second
+                if (now - last_capture_t) > 0.5:
+                    sec = int(remaining)
+                    if sec != countdown_last_sec:
+                        countdown_last_sec = sec
+                        EPD_UI.show_mode_prompt(current_mode, remaining / ARM_TIMEOUT_S)
+
                 lap_c = center_laplacian(bgr)
                 thr_enter = motion_thr_dyn * ENTER_RELAX
                 thr_exit  = motion_thr_dyn * EXIT_RELAX
@@ -744,7 +786,8 @@ try:
                                     tag = current_mode or "unknown_mode"
                                     print(f"[mode] stable -> capturing ({tag})  mo={motion_ema:.4f}/{motion_thr_dyn:.4f} lap={lap_c:.1f}/{lap_thr_dyn+LAPLACE_MARGIN:.1f}")
                                     start_capture_thread(tag)
-                                    EPD_UI.show_captured(tag, "checked in!" if tag == "check_in" else "discarded!")
+                                    msg = "\u2713 CHECKED IN!" if tag == "check_in" else "\u2717 DISCARDED!"
+                                    EPD_UI.show_captured(tag, msg, 1.0)
                                     last_capture_t = now
                                     arm_time = now
                                     stable_count = 0
@@ -769,10 +812,11 @@ try:
                 need_clear = False
                 armed = True
                 arm_time = now
+                countdown_last_sec = -1
                 presence_dwell_start = None
                 print("[mode] scene cleared; re-armed")
                 if current_mode:
-                    EPD_UI.show_mode_prompt(current_mode)
+                    EPD_UI.show_mode_prompt(current_mode, 1.0)
 
             cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
