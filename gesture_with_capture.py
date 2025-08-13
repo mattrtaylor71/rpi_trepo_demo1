@@ -950,19 +950,19 @@ try:
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
-                # Presence dwell: start timing only when BOTH gates are met
-                if below_enter and sharp_enough:
-                    if presence_dwell_start is None:
-                        presence_dwell_start = now
-                else:
-                    presence_dwell_start = None
-
                 # Safety valve (optional): very steady for a while → let sharpness slide
                 if (not sharp_enough) and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
                     sharp_enough = True
                     if presence_dwell_start is None:
                         presence_dwell_start = now  # begin dwell from now
                     print("[stable?] overriding sharpness due to sustained steadiness")
+
+                # Presence dwell: start timing only when BOTH gates are met
+                if below_enter and sharp_enough:
+                    if presence_dwell_start is None:
+                        presence_dwell_start = now
+                else:
+                    presence_dwell_start = None
 
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
