@@ -4,11 +4,6 @@ import cv2
 from picamera2 import Picamera2
 
 
-import time, os, collections, threading, queue, base64, datetime
-import numpy as np
-import cv2
-from picamera2 import Picamera2
-
 # ─────────────────────────────────────────────────────────────────────────────
 # EPAPER UI (2.13" mono B/W V4) — PARTIAL-ONLY AFTER BOOT (no flashing)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,6 +34,7 @@ class EpaperUI:
         self.epd = None
         self.W = self.H = None
         self.font_big = self.font_md = self.font_sm = None
+        self.font_italic = None
         self.q = _Q(maxsize=8)
         self.cur_mode = None
         self.last_screen = None
@@ -94,18 +90,24 @@ class EpaperUI:
                 self.rotate_deg = 0
             self.rotate_180 = False
 
-            # fonts
+            # fonts (regular + italic fallback)
             base = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
             font1 = os.path.join(base, "font", "Font.ttc")
+            italic_fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf"
+            regular_fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
             if os.path.exists(font1):
                 self.font_big = _Font.truetype(font1, 26)
                 self.font_md  = _Font.truetype(font1, 18)
                 self.font_sm  = _Font.truetype(font1, 14)
+                try:
+                    self.font_italic = _Font.truetype(font1, 16)
+                except Exception:
+                    self.font_italic = _Font.truetype(italic_fallback, 16) if os.path.exists(italic_fallback) else _Font.truetype(regular_fallback, 16)
             else:
-                f = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-                self.font_big = _Font.truetype(f, 26)
-                self.font_md  = _Font.truetype(f, 18)
-                self.font_sm  = _Font.truetype(f, 14)
+                self.font_big = _Font.truetype(regular_fallback, 26)
+                self.font_md  = _Font.truetype(regular_fallback, 18)
+                self.font_sm  = _Font.truetype(regular_fallback, 14)
+                self.font_italic = _Font.truetype(italic_fallback, 16) if os.path.exists(italic_fallback) else _Font.truetype(regular_fallback, 16)
 
             # 2) Immediately enter PARTIAL and set a white base image
             self._enter_partial_mode()
@@ -114,7 +116,6 @@ class EpaperUI:
             try:
                 self.epd.displayPartBaseImage(self._buf(white))
             except Exception:
-                # Some forks don’t expose this; partial will still work but may ghost a bit more
                 self.epd.displayPartial(self._buf(white))
             self.prev = white
             self._last_hard = time.time()
@@ -173,7 +174,6 @@ class EpaperUI:
             elif hasattr(self.epd, "init_fast"):
                 self.epd.init_fast()
             else:
-                # Some forks use Init_Partial/init_Partial
                 if   hasattr(self.epd, "Init_Partial"):  self.epd.Init_Partial()
                 elif hasattr(self.epd, "init_Partial"):  self.epd.init_Partial()
                 else:                                     self.epd.init()
@@ -195,7 +195,6 @@ class EpaperUI:
             elif hasattr(self.epd, "display_Partial"):
                 self.epd.display_Partial(self._buf(out))
             else:
-                # Fallback: still in partial LUT, so this won’t hard-flash
                 self.epd.display(self._buf(out))
         except Exception as e:
             print(f"[EPD] partial draw failed: {e}")
@@ -204,7 +203,6 @@ class EpaperUI:
     def _hard_refresh(self):
         """Optional: scrub ghosting with a full cycle, then re-prime partial base."""
         try:
-            # FULL
             if hasattr(self.epd, "FULL_UPDATE"):
                 self.epd.init(self.epd.FULL_UPDATE)
             else:
@@ -216,7 +214,6 @@ class EpaperUI:
                 self.epd.Clear(0xFF)
             except Exception:
                 pass
-            # Back to PART + base
             self._enter_partial_mode()
             try:
                 self.epd.displayPartBaseImage(self._buf(white))
@@ -227,10 +224,25 @@ class EpaperUI:
         except Exception as e:
             print(f"[EPD] hard refresh failed: {e}")
 
+    # Utility: centered boxed label
+    def _centered_box_text(self, d, y, text, font, pad_x=8, pad_y=4):
+        # Measure text bbox to center
+        bbox = d.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        x = (self.W - tw) // 2
+        # Box with padding
+        x0 = max(0, x - pad_x); y0 = max(0, y - pad_y)
+        x1 = min(self.W - 1, x + tw + pad_x); y1 = min(self.H - 1, y + th + pad_y)
+        d.rectangle((x0, y0, x1, y1), outline=0, width=1)
+        d.text((x, y), text, font=font, fill=0)
+        return (x0, y0, x1, y1)  # return for reference if needed
+
     # Screens (all push via partial — zero flashing)
     def _draw_main(self):
         img, d = self._new_layer()
-        d.text((8, 8), "Swipe to choose mode", font=self.font_md, fill=0)
+        # Keep “main” similar to before (centered title & arrows)
+        self._centered_box_text(d, 6, "Swipe to choose mode", self.font_md, pad_x=10, pad_y=4)
         y = int(self.H * 0.60); s = 20
         self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
         d.text((int(self.W * 0.24), y + 18), "discard", font=self.font_sm, fill=0)
@@ -241,33 +253,35 @@ class EpaperUI:
 
     def _draw_mode(self, mode):
         img, d = self._new_layer()
-        title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
-        d.text((8, 8), title, font=self.font_big, fill=0)
-        d.text((8, 36), "Hold item still ~1ft from camera", font=self.font_md, fill=0)
-        y = int(self.H * 0.60); s = 20
-        if mode == "discard":
-            self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
-        elif mode == "check_in":
-            self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
-        else:
-            d.rectangle((int(self.W*0.45), y-10, int(self.W*0.55), y+10), outline=0, width=2)
+
+        # Top-center boxed mode name
+        title = {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
+        self._centered_box_text(d, 6, title, self.font_big, pad_x=10, pad_y=4)
+
+        # Centered italic helper line
+        helper = "hold items 1–2ft away from camera"
+        bbox = d.textbbox((0, 0), helper, font=self.font_italic)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        d.text(((self.W - tw)//2, (self.H - th)//2), helper, font=self.font_italic, fill=0)
+
         d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
         self._push_partial(img)
 
     def _draw_captured(self, mode, ok_text):
         img, d = self._new_layer()
-        title = "Mode: " + {"discard":"DISCARD","check_in":"CHECK-IN","opened":"OPENED","other":"OTHER"}.get(mode, mode or "--").upper()
-        d.text((8, 8), title, font=self.font_big, fill=0)
-        x0, y0, x1, y1 = 8, 36, self.W - 8, 76
-        d.rectangle((x0, y0, x1, y1), outline=0, fill=255)
-        d.text((x0 + 10, y0 + 6), ok_text, font=self.font_md, fill=0)
-        d.text((8, 84), "Hold item still ~1ft from camera", font=self.font_md, fill=0)
-        y = int(self.H * 0.60); s = 20
-        if mode == "discard":
-            self._arrow(d, x=int(self.W * 0.30), y=y, size=s, direction="left")
-        elif mode == "check_in":
-            self._arrow(d, x=int(self.W * 0.70), y=y, size=s, direction="right")
-        d.rectangle((0, 0, self.W - 1, self.H - 1), outline=0, width=1)
+
+        # Single centered boxed banner only (no other text)
+        banner = ok_text.strip()
+        bbox = d.textbbox((0, 0), banner, font=self.font_big)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        x = (self.W - tw)//2
+        y = (self.H - th)//2
+        pad_x, pad_y = 12, 6
+        d.rectangle((x - pad_x, y - pad_y, x + tw + pad_x, y + th + pad_y), outline=0, width=2)
+        d.text((x, y), banner, font=self.font_big, fill=0)
+
         self._push_partial(img)
 
     def _arrow(self, draw, x, y, size=24, direction="left"):
@@ -284,9 +298,6 @@ class EpaperUI:
 EPD_UI = EpaperUI()
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-# Create a singleton UI (safe even if epaper libs absent)
-EPD_UI = EpaperUI()
 
 # --------------------------
 # OpenAI API (vision)
@@ -829,6 +840,9 @@ try:
                 armed = True
                 arm_time = now
                 print("[mode] scene cleared; re-armed for next item")
+                # ⬇️ Draw the mode prompt again automatically after re-arming
+                if current_mode:
+                    EPD_UI.show_mode_prompt(current_mode)
 
             cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
