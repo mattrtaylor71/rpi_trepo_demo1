@@ -341,8 +341,16 @@ def api_worker():
         try:
             b64 = base64.b64encode(jpeg_bytes).decode("ascii")
             if tag == "expiry":
-                user_text = "This is a food item. The expiration date is shown. Extract the expiration or best-by date."
-                system_text = "You read expiration dates from product photos. Respond with the date only."
+                user_text = (
+                    "This is a close-up photo of a food item's packaging. "
+                    "Several numbers or codes may be visible. "
+                    "Identify the expiration or best-by date."
+                )
+                system_text = (
+                    "You are an expert at reading expiration dates from product photos. "
+                    "Think carefully and use intuition to choose the most plausible date, "
+                    "even if the numbers are grainy. Respond with the date only."
+                )
             else:
                 user_text = f"Identify the object. (mode={tag})"
                 system_text = "You are an expert product identifier. Be concise."
@@ -443,6 +451,10 @@ LAPLACE_MARGIN        = 3.0
 MOTION_THR_SCALE = 1.5
 MOTION_THR_FLOOR = 0.004
 MAX_MOTION_THR   = 0.040
+
+# When users hold items very close for expiry capture, small hand tremors
+# look like large motion. Allow more motion tolerance in that scenario.
+EXPIRY_MOTION_RELAX = 1.8
 
 STEADY_OVERRIDE_AFTER_S = 2.8            # safety valve
 
@@ -785,8 +797,9 @@ try:
                         EPD_UI.show_mode_prompt(display_mode, remaining / total)
 
                 lap_c = center_laplacian(bgr)
-                thr_enter = motion_thr_dyn * ENTER_RELAX
-                thr_exit  = motion_thr_dyn * EXIT_RELAX
+                motion_relax = EXPIRY_MOTION_RELAX if awaiting_expiry else 1.0
+                thr_enter = motion_thr_dyn * ENTER_RELAX * motion_relax
+                thr_exit  = motion_thr_dyn * EXIT_RELAX * motion_relax
 
                 sharp_enough = (lap_c >= (lap_thr_dyn + LAPLACE_MARGIN))
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
