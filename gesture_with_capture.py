@@ -431,7 +431,8 @@ EXPIRY_WAIT_S = 8.0
 
 # Stability / thresholds
 WAIT_AFTER_SWIPE_S   = 1.0
-STABILITY_WINDOW_FR  = 12
+# slightly shorter window so we accept stabilization sooner
+STABILITY_WINDOW_FR  = 10
 MOTION_EMA_ALPHA     = 0.25              # single source of truth
 
 PRESENCE_LAPLACE_MIN  = 10.0
@@ -448,7 +449,8 @@ STEADY_OVERRIDE_AFTER_S = 2.8            # safety valve
 ARM_TIMEOUT_S    = 8.0
 ENTER_RELAX      = 1.00
 EXIT_RELAX       = 1.20
-MIN_STABLE_S     = 0.50
+# reduce required stable duration to be a bit more sensitive
+MIN_STABLE_S     = 0.40
 CONFIRM_FR       = 2
 
 stable_since = None
