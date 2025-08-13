@@ -12,6 +12,11 @@ absl_logging.set_verbosity(absl_logging.ERROR)
 import mediapipe as mp
 mp_hands = mp.solutions.hands
 
+# E-paper and drawing
+from PIL import Image, ImageDraw, ImageFont
+from datetime import datetime
+from waveshare_epd import epd2in13b_V4
+
 # =========================
 # Ultra-fast LR/UD swipes via column/row motion energy + pinch
 # =========================
@@ -53,6 +58,85 @@ IGNORE_SWIPES_WHEN_PINCH = True
 SHOW_PINCH_RATIO = True
 
 HEADLESS = os.environ.get("DISPLAY", "") == ""
+
+# =========================
+# E-paper inventory display
+# =========================
+epd = epd2in13b_V4.EPD()
+epd.init()
+W, H = epd.height, epd.width
+
+def _pick_font(size):
+    """Prefer repo font/Font.ttc, fallback to system DejaVu, else default."""
+    fontdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'font')
+    candidates = [
+        os.path.join(fontdir, 'Font.ttc'),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+INVENTORY = [
+    {"title": "Milk", "expiry": "2024-07-01"},
+    {"title": "Eggs", "expiry": "2024-07-05"},
+    {"title": "Cheese", "expiry": "2024-07-07"},
+]
+INVENTORY.sort(key=lambda item: datetime.strptime(item["expiry"], "%Y-%m-%d"))
+
+MODE_MAIN, MODE_INV = "MAIN", "INVENTORY"
+mode = MODE_MAIN
+inv_idx = 0
+last_gesture_time = time.time()
+
+def display_main():
+    black = Image.new('1', (W, H), 255)
+    red = Image.new('1', (W, H), 255)
+    draw_b = ImageDraw.Draw(black)
+    font = _pick_font(24)
+    draw_b.text((10, 10), "Main Screen", font=font, fill=0)
+    epd.display(epd.getbuffer(black), epd.getbuffer(red))
+
+def display_inventory(idx):
+    item = INVENTORY[idx]
+    black = Image.new('1', (W, H), 255)
+    red = Image.new('1', (W, H), 255)
+    draw_b = ImageDraw.Draw(black)
+    title_font = _pick_font(24)
+    exp_font = _pick_font(18)
+    draw_b.text((10, 10), item["title"], font=title_font, fill=0)
+    draw_b.text((10, H-30), item["expiry"], font=exp_font, fill=0)
+    epd.display(epd.getbuffer(black), epd.getbuffer(red))
+
+display_main()
+
+def handle_gesture(g):
+    global mode, inv_idx, last_gesture_time
+    if not g:
+        return
+    last_gesture_time = time.time()
+    if mode == MODE_MAIN:
+        if g == "SWIPE_UP":
+            mode = MODE_INV
+            inv_idx = 0
+            display_inventory(inv_idx)
+    elif mode == MODE_INV:
+        if g == "SWIPE_LEFT":
+            inv_idx = max(0, inv_idx-1)
+            display_inventory(inv_idx)
+        elif g == "SWIPE_RIGHT":
+            inv_idx = min(len(INVENTORY)-1, inv_idx+1)
+            display_inventory(inv_idx)
+
+def maybe_timeout():
+    global mode, last_gesture_time
+    if mode == MODE_INV and (time.time() - last_gesture_time) > 10:
+        mode = MODE_MAIN
+        display_main()
 
 # =========================
 # Helpers
@@ -260,6 +344,9 @@ try:
             gesture_text = "SWIPE_DOWN" if vel_y>0 else "SWIPE_UP"
             last_fire = now; state_y = "IDLE"; trace_y.clear()
 
+        handle_gesture(gesture_text)
+        maybe_timeout()
+
         # HUD
         cv2.line(dbg, (int(CROSS_L*FRAME_W), 0), (int(CROSS_L*FRAME_W), FRAME_H), (255,255,255), 1)
         cv2.line(dbg, (int(CROSS_R*FRAME_W), 0), (int(CROSS_R*FRAME_W), FRAME_H), (255,255,255), 1)
@@ -291,3 +378,7 @@ finally:
     picam2.stop()
     if not HEADLESS:
         cv2.destroyAllWindows()
+    try:
+        epd.sleep()
+    except Exception:
+        pass
