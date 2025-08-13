@@ -376,35 +376,39 @@ SMOOTH_COLS, SMOOTH_ROWS = 5, 5
 POOL_FRAMES = 3
 HEADLESS = os.environ.get("DISPLAY", "") == ""
 
-CAPTURE_COOLDOWN_S = 0.8
+CAPTURE_COOLDOWN_S = 2.5
 last_capture_t = 0.0
 
 # Stability / thresholds
-WAIT_AFTER_SWIPE_S   = 0.9
-STABILITY_WINDOW_FR  = 8
+WAIT_AFTER_SWIPE_S   = 1.0
+STABILITY_WINDOW_FR  = 12
 MOTION_EMA_ALPHA     = 0.25              # single source of truth
 
-PRESENCE_LAPLACE_MIN = 6.0
-PRESENCE_LAPLACE_GAIN = 1.20
-MAX_LAPLACE_THR      = 85.0
+PRESENCE_LAPLACE_MIN  = 10.0
+PRESENCE_LAPLACE_GAIN = 1.35
+MAX_LAPLACE_THR       = 95.0
+LAPLACE_MARGIN        = 3.0
 
-MOTION_THR_SCALE = 1.9
+MOTION_THR_SCALE = 1.5
 MOTION_THR_FLOOR = 0.004
-MAX_MOTION_THR   = 0.06
+MAX_MOTION_THR   = 0.040
 
-STEADY_OVERRIDE_AFTER_S = 1.6            # safety valve
+STEADY_OVERRIDE_AFTER_S = 2.8            # safety valve
 
 ARM_TIMEOUT_S    = 8.0
 ENTER_RELAX      = 1.00
 EXIT_RELAX       = 1.20
-MIN_STABLE_S     = 0.35
+MIN_STABLE_S     = 0.50
 CONFIRM_FR       = 2
 
 stable_since = None
 confirm_left = 0
+presence_dwell_start = None
 
-CLEAR_LAPLACE_FRAC = 0.65
-CLEAR_WINDOW_FR    = 6
+CLEAR_LAPLACE_FRAC = 0.75
+CLEAR_WINDOW_FR    = 10
+MIN_CLEAR_S        = 1.2
+PRESENCE_DWELL_S   = 0.60
 need_clear  = False
 clear_count = 0
 
@@ -522,7 +526,7 @@ FLIP_Y = False
 def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
-    global need_clear, stable_since, confirm_left
+    global need_clear, stable_since, confirm_left, presence_dwell_start
 
     m = MODE_MAP.get(gesture)
     if not m: return
@@ -533,6 +537,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     stable_count = 0
     stable_since = None
     confirm_left = 0
+    presence_dwell_start = None
 
     if bgr_for_baseline is not None:
         lap_baseline = center_laplacian(bgr_for_baseline)
@@ -672,80 +677,98 @@ try:
             g = "SWIPE_RIGHT" if vel_x > 0 else "SWIPE_LEFT"
             print(f"{g} (span/vel)"); set_mode_and_seed(g); last_fire = now; state_x = "IDLE"; trace_x.clear()
 
-        # Armed: stability gate
+        # ---------------------------
+        # Armed: wait-for-stability
+        # ---------------------------
         if armed:
             if (now - last_capture_t) < CAPTURE_COOLDOWN_S:
                 stable_count = 0
+                presence_dwell_start = None
             elif (now - arm_time) > ARM_TIMEOUT_S:
                 print("[mode] timeout; disarming without capture")
                 EPD_UI.show_timeout()
                 armed = False
+                presence_dwell_start = None
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
                 stable_count = 0
+                presence_dwell_start = None
             else:
                 lap_c = center_laplacian(bgr)
                 thr_enter = motion_thr_dyn * ENTER_RELAX
                 thr_exit  = motion_thr_dyn * EXIT_RELAX
 
-                sharp_enough = (lap_c >= lap_thr_dyn)
+                sharp_enough = (lap_c >= (lap_thr_dyn + LAPLACE_MARGIN))
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
-                # Safety valve: very steady for a while → allow
-                if not sharp_enough and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
-                    sharp_enough = True
-                    print("[stable?] overriding sharpness gate due to sustained steadiness")
+                # Presence dwell: start timing only when BOTH gates are met
+                if below_enter and sharp_enough:
+                    if presence_dwell_start is None:
+                        presence_dwell_start = now
+                else:
+                    presence_dwell_start = None
 
-                # Debug (light rate-limit)
+                # Safety valve (optional): very steady for a while → let sharpness slide
+                if (not sharp_enough) and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
+                    sharp_enough = True
+                    if presence_dwell_start is None:
+                        presence_dwell_start = now  # begin dwell from now
+                    print("[stable?] overriding sharpness due to sustained steadiness")
+
+                # Debug
                 if int(time.time() * 5) % 5 == 0:
-                    print(f"[stable?] motion_ema={motion_ema:.4f} thr={thr_enter:.4f} "
-                          f"lap={lap_c:.1f}/{lap_thr_dyn:.1f} ok_mo={below_enter} ok_sh={sharp_enough}")
+                    print(f"[stable?] mo={motion_ema:.4f} < {thr_enter:.4f} lap={lap_c:.1f} >= {lap_thr_dyn+LAPLACE_MARGIN:.1f} "
+                          f"dwell={(0 if presence_dwell_start is None else now-presence_dwell_start):.2f}/{PRESENCE_DWELL_S:.2f}")
 
                 if above_exit or not sharp_enough:
                     stable_count = 0
                     stable_since = None
                     confirm_left = 0
-                elif below_enter and sharp_enough:
-                    stable_count += 1
-                    if stable_since is None:
-                        stable_since = now
-                    if (now - stable_since) >= MIN_STABLE_S and stable_count >= STABILITY_WINDOW_FR:
-                        if confirm_left == 0:
-                            confirm_left = CONFIRM_FR
-                        else:
-                            confirm_left -= 1
+                else:
+                    if below_enter and sharp_enough and presence_dwell_start and (now - presence_dwell_start) >= PRESENCE_DWELL_S:
+                        # classic frame-count requirement too
+                        stable_count += 1
+                        if stable_since is None:
+                            stable_since = now
+                        if (now - stable_since) >= MIN_STABLE_S and stable_count >= STABILITY_WINDOW_FR:
                             if confirm_left == 0:
-                                tag = current_mode or "unknown_mode"
-                                print(f"[mode] stable -> capturing ({tag})  motion={motion_ema:.4f} thr={motion_thr_dyn:.4f} lap={lap_c:.1f} thr={lap_thr_dyn:.1f}")
-                                start_capture_thread(tag)
-                                EPD_UI.show_captured(tag, "checked in!" if tag == "check_in" else "discarded!")
-                                last_capture_t = now
-                                arm_time = now
-                                stable_count = 0
-                                stable_since = None
-                                need_clear = True
-                                armed = False
-                                clear_count = 0
-                                print("[mode] captured; waiting for item removal to re-arm")
+                                confirm_left = CONFIRM_FR
+                            else:
+                                confirm_left -= 1
+                                if confirm_left == 0:
+                                    tag = current_mode or "unknown_mode"
+                                    print(f"[mode] stable -> capturing ({tag})  mo={motion_ema:.4f}/{motion_thr_dyn:.4f} lap={lap_c:.1f}/{lap_thr_dyn+LAPLACE_MARGIN:.1f}")
+                                    start_capture_thread(tag)
+                                    EPD_UI.show_captured(tag, "checked in!" if tag == "check_in" else "discarded!")
+                                    last_capture_t = now
+                                    arm_time = now
+                                    stable_count = 0
+                                    stable_since = None
+                                    presence_dwell_start = None
+                                    need_clear = True
+                                    armed = False
+                                    clear_count = 0
+                                    print("[mode] captured; waiting for item removal to re-arm")
 
-                # HUD (optional)
-                closeness = 1.0 - np.clip((motion_ema or 0.0) / (motion_thr_dyn or 1e-6), 0.0, 1.0)
-                cv2.rectangle(dbg, (20, 50), (20 + int(200*closeness), 65), (255,255,255), -1)
-                cv2.putText(dbg, f"STABLE {stable_count}/{STABILITY_WINDOW_FR} dwell>={MIN_STABLE_S:.2f}s lap={int(lap_c)}>={int(lap_thr_dyn)}",
-                            (230, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2)
-
-        # Re-arm when item removed (low detail for a few frames)
+        # Re-arm when item is removed (center detail low for a few frames + min time)
         if need_clear:
             lap_c = center_laplacian(bgr)
             clear_thr = max(PRESENCE_LAPLACE_MIN * 0.8, lap_thr_dyn * CLEAR_LAPLACE_FRAC)
-            clear_count = clear_count + 1 if lap_c < clear_thr else 0
-            if clear_count >= CLEAR_WINDOW_FR:
+            if lap_c < clear_thr:
+                clear_count += 1
+            else:
+                clear_count = 0
+
+            ready_by_time = (now - last_capture_t) >= MIN_CLEAR_S
+            if ready_by_time and clear_count >= CLEAR_WINDOW_FR:
                 need_clear = False
                 armed = True
                 arm_time = now
+                presence_dwell_start = None
                 print("[mode] scene cleared; re-armed")
                 if current_mode:
                     EPD_UI.show_mode_prompt(current_mode)
+
             cv2.putText(dbg, "REMOVE ITEM", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
         # HUD
