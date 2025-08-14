@@ -889,7 +889,7 @@ try:
 
         def handle_gesture(gesture: str):
             global motion_thr_dyn, inventory_mode, inventory_rows, inventory_idx
-            global inventory_last_gesture, inventory_last_draw
+            global inventory_last_gesture, inventory_last_draw, current_mode
             if inventory_mode:
                 inventory_last_gesture = now
                 if gesture == "SWIPE_LEFT":
