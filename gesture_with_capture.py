@@ -631,8 +631,8 @@ STEADY_OVERRIDE_AFTER_S = 2.8            # safety valve
 ARM_TIMEOUT_S    = 8.0
 ENTER_RELAX      = 1.00
 EXIT_RELAX       = 1.20
-# reduce required stable duration to be a bit more sensitive
-MIN_STABLE_S     = 0.40
+# allow a bit less dwell before treating as stable
+MIN_STABLE_S     = 0.35
 CONFIRM_FR       = 2
 
 stable_since = None
@@ -1050,7 +1050,6 @@ try:
                         presence_dwell_start = now
                 else:
                     presence_dwell_start = None
-
 
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
