@@ -1,4 +1,4 @@
-import time, os, collections, threading, queue, base64, datetime, csv
+import time, os, collections, threading, queue, base64, datetime, csv, re
 import numpy as np
 import cv2
 from picamera2 import Picamera2
@@ -362,7 +362,16 @@ class EpaperUI:
             y += 4
             self._centered_text(d, y, f"expiry: {item.get('expiry', '')}", self.font_sm)
             y += 16
-            opened = item.get('opened_date') or "--"
+            opened_date = item.get('opened_date')
+            if opened_date:
+                try:
+                    od = datetime.date.fromisoformat(opened_date)
+                    days = (datetime.date.today() - od).days
+                    opened = "today" if days == 0 else f"{days} day{'s' if days != 1 else ''} ago"
+                except Exception:
+                    opened = opened_date
+            else:
+                opened = "--"
             self._centered_text(d, y, f"opened: {opened}", self.font_sm)
 
         # Scroll arrows
@@ -430,10 +439,40 @@ def save_inventory(rows):
         writer.writeheader()
         writer.writerows(rows)
 
+def _parse_date_safe(s):
+    try:
+        return datetime.date.fromisoformat(s)
+    except Exception:
+        return datetime.date.max
+
+def normalize_expiry_date(text):
+    text = (text or "").strip()
+    m_year = re.search(r"(20\d{2})", text)
+    if not m_year:
+        return text
+    year = int(m_year.group(1))
+    rest = re.sub(m_year.group(1), "", text, count=1)
+    digits = re.findall(r"\d+", rest)
+    month = int(digits[0]) if digits else 1
+    day = int(digits[1]) if len(digits) > 1 else 1
+    if month > 12 and day <= 12:
+        month, day = day, month
+    try:
+        dt = datetime.date(year, max(1, min(month, 12)), max(1, min(day, 31)))
+        return dt.isoformat()
+    except Exception:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+
+def sort_inventory_by_expiry(rows):
+    for r in rows:
+        r["expiry"] = normalize_expiry_date(r.get("expiry", ""))
+    rows.sort(key=lambda r: _parse_date_safe(r.get("expiry", "")))
+    return rows
+
 def add_inventory_item(name, expiry):
     with inventory_lock:
         rows = load_inventory()
-        rows.append({"name": name, "expiry": expiry, "state": "sealed", "opened_date": ""})
+        rows.append({"name": name, "expiry": normalize_expiry_date(expiry), "state": "sealed", "opened_date": ""})
         save_inventory(rows)
 
 def match_inventory_item(query_name, inventory_names, client):
@@ -481,8 +520,9 @@ def handle_openai_result(tag, text, client):
         print(f"[inventory] pending: {pending_item_name}")
     elif tag == "expiry":
         if pending_item_name:
-            add_inventory_item(pending_item_name, text)
-            print(f"[inventory] added: {pending_item_name} exp {text}")
+            iso = normalize_expiry_date(text)
+            add_inventory_item(pending_item_name, iso)
+            print(f"[inventory] added: {pending_item_name} exp {iso}")
             pending_item_name = None
         else:
             print(f"[inventory] no pending item for expiry '{text}'")
@@ -518,7 +558,8 @@ def api_worker():
                 system_text = (
                     "You are an expert at reading expiration dates from product photos. "
                     "Think carefully and use intuition to choose the most plausible date, "
-                    "even if the numbers are grainy. Respond with the date only."
+                    "even if the numbers are grainy. Respond with the date only in the YYYY-MM-DD format. "
+                    "If the day is missing, use the first of that month."
                 )
             else:
                 user_text = f"Identify the object. (mode={tag})"
@@ -917,7 +958,8 @@ try:
                 if current_mode is not None:
                     return
                 if gesture == "SWIPE_UP":
-                    inventory_rows = load_inventory()
+                    inventory_rows = sort_inventory_by_expiry(load_inventory())
+                    save_inventory(inventory_rows)
                     inventory_idx = 0
                     inventory_last_gesture = now
                     inventory_mode = True
