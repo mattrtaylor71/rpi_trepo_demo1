@@ -912,6 +912,9 @@ try:
                 EPD_UI.show_inventory(item, frac)
                 inventory_last_draw = now
             else:
+                # Only interpret swipes as mode changes when on the main screen
+                if current_mode is not None:
+                    return
                 if gesture == "SWIPE_UP":
                     inventory_rows = load_inventory()
                     inventory_idx = 0
