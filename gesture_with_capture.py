@@ -655,9 +655,8 @@ STABILITY_WINDOW_FR  = 10
 MOTION_EMA_ALPHA     = 0.25              # single source of truth
 
 PRESENCE_LAPLACE_MIN  = 6.0
-PRESENCE_LAPLACE_GAIN = 1.20
+LAPLACE_MARGIN        = 8.0       # additive margin over baseline detail
 MAX_LAPLACE_THR       = 95.0
-LAPLACE_MARGIN        = 0.0
 
 MOTION_THR_SCALE = 1.5
 MOTION_THR_FLOOR = 0.004
@@ -832,11 +831,10 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
 
     if bgr_for_baseline is not None:
         lap_baseline = center_laplacian(bgr_for_baseline)
-        lap_thr_dyn  = max(PRESENCE_LAPLACE_MIN, lap_baseline * PRESENCE_LAPLACE_GAIN)
-        lap_thr_dyn  = min(lap_thr_dyn, MAX_LAPLACE_THR)
     else:
         lap_baseline = 0.0
-        lap_thr_dyn  = PRESENCE_LAPLACE_MIN
+    lap_thr_dyn = max(PRESENCE_LAPLACE_MIN, lap_baseline + LAPLACE_MARGIN)
+    lap_thr_dyn = min(lap_thr_dyn, MAX_LAPLACE_THR)
 
     print(f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f}  lap_thr={lap_thr_dyn:.1f}")
 
@@ -1080,7 +1078,7 @@ try:
                 thr_enter = motion_thr_dyn * ENTER_RELAX * motion_relax
                 thr_exit  = motion_thr_dyn * EXIT_RELAX * motion_relax
 
-                sharp_enough = (lap_c >= (lap_thr_dyn + LAPLACE_MARGIN))
+                sharp_enough = (lap_c >= lap_thr_dyn)
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
@@ -1101,8 +1099,10 @@ try:
 
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
-                    print(f"[stable?] mo={motion_ema:.4f} < {thr_enter:.4f} lap={lap_c:.1f} >= {lap_thr_dyn+LAPLACE_MARGIN:.1f} "
-                          f"dwell={(0 if presence_dwell_start is None else now-presence_dwell_start):.2f}/{PRESENCE_DWELL_S:.2f}")
+                    print(
+                        f"[stable?] mo={motion_ema:.4f} < {thr_enter:.4f} lap={lap_c:.1f} >= {lap_thr_dyn:.1f} "
+                        f"dwell={(0 if presence_dwell_start is None else now-presence_dwell_start):.2f}/{PRESENCE_DWELL_S:.2f}"
+                    )
 
                 if above_exit or not sharp_enough:
                     stable_count = 0
@@ -1121,7 +1121,7 @@ try:
                                 confirm_left -= 1
                                 if confirm_left == 0:
                                     tag = "expiry" if awaiting_expiry else (current_mode or "unknown_mode")
-                                    print(f"[mode] stable -> capturing ({tag})  mo={motion_ema:.4f}/{motion_thr_dyn:.4f} lap={lap_c:.1f}/{lap_thr_dyn+LAPLACE_MARGIN:.1f}")
+                                    print(f"[mode] stable -> capturing ({tag})  mo={motion_ema:.4f}/{motion_thr_dyn:.4f} lap={lap_c:.1f}/{lap_thr_dyn:.1f}")
                                     start_capture_thread(tag)
                                     if tag == "check_in":
                                         msg = "\u2713 CHECKED IN!"
