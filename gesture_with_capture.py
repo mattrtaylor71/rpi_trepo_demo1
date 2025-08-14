@@ -655,13 +655,12 @@ STABILITY_WINDOW_FR  = 10
 MOTION_EMA_ALPHA     = 0.25              # single source of truth
 
 PRESENCE_LAPLACE_MIN  = 6.0
-PRESENCE_LAPLACE_GAIN = 1.20
+LAPLACE_MARGIN        = 8.0       # additive margin over baseline detail
 MAX_LAPLACE_THR       = 95.0
-LAPLACE_MARGIN        = 0.0
 
-MOTION_THR_SCALE = 1.5
 MOTION_THR_FLOOR = 0.004
 MAX_MOTION_THR   = 0.040
+MOTION_MARGIN    = 0.010        # additive margin over baseline motion
 
 # When users hold items very close for expiry capture, small hand tremors
 # look like large motion. Allow more motion tolerance in that scenario.
@@ -802,15 +801,17 @@ inventory_last_draw = 0.0
 
 motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
+motion_base = MOTION_THR_FLOOR
 lap_baseline = 0.0
 lap_thr_dyn  = PRESENCE_LAPLACE_MIN
+lap_low_dyn  = 0.0
 
 FLIP_X = True
 FLIP_Y = False
 
-def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
+def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None, motion_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
-    global motion_thr_dyn, lap_baseline, lap_thr_dyn
+    global motion_thr_dyn, motion_base, lap_baseline, lap_thr_dyn, lap_low_dyn
     global need_clear, stable_since, confirm_left, presence_dwell_start
     global motion_since_arm
     global countdown_last_sec, awaiting_expiry, expiry_prompt_time
@@ -832,13 +833,22 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
 
     if bgr_for_baseline is not None:
         lap_baseline = center_laplacian(bgr_for_baseline)
-        lap_thr_dyn  = max(PRESENCE_LAPLACE_MIN, lap_baseline * PRESENCE_LAPLACE_GAIN)
-        lap_thr_dyn  = min(lap_thr_dyn, MAX_LAPLACE_THR)
     else:
         lap_baseline = 0.0
-        lap_thr_dyn  = PRESENCE_LAPLACE_MIN
+    lap_thr_dyn = max(PRESENCE_LAPLACE_MIN, lap_baseline + LAPLACE_MARGIN)
+    lap_thr_dyn = min(lap_thr_dyn, MAX_LAPLACE_THR)
+    lap_low_dyn = max(0.0, lap_baseline - LAPLACE_MARGIN)
 
-    print(f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f}  lap_thr={lap_thr_dyn:.1f}")
+    if motion_for_baseline is not None:
+        motion_base = motion_for_baseline
+    else:
+        motion_base = MOTION_THR_FLOOR
+    motion_thr_dyn = min(MAX_MOTION_THR, motion_base + MOTION_MARGIN)
+
+    print(
+        f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f} lap_hi={lap_thr_dyn:.1f} lap_lo={lap_low_dyn:.1f} "
+        f"mo_base={motion_base:.4f} mo_thr={motion_thr_dyn:.4f}"
+    )
 
 try:
     while True:
@@ -929,7 +939,7 @@ try:
         can_fire = (now - last_fire) > COOLDOWN_S
 
         def handle_gesture(gesture: str):
-            global motion_thr_dyn, inventory_mode, inventory_rows, inventory_idx
+            global inventory_mode, inventory_rows, inventory_idx
             global inventory_last_gesture, inventory_last_draw, current_mode
             if inventory_mode:
                 inventory_last_gesture = now
@@ -970,8 +980,7 @@ try:
                     inventory_last_draw = now
                     return
                 ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
-                motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))
-                set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
+                set_mode_from(gesture, now_ts, bgr_for_baseline=bgr, motion_for_baseline=ema)
                 EPD_UI.show_mode_prompt(current_mode, 1.0)
                 cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
@@ -1077,10 +1086,10 @@ try:
 
                 lap_c = center_laplacian(bgr)
                 motion_relax = EXPIRY_MOTION_RELAX if awaiting_expiry else 1.0
-                thr_enter = motion_thr_dyn * ENTER_RELAX * motion_relax
-                thr_exit  = motion_thr_dyn * EXIT_RELAX * motion_relax
+                thr_enter = motion_base + MOTION_MARGIN * ENTER_RELAX * motion_relax
+                thr_exit  = motion_base + MOTION_MARGIN * EXIT_RELAX * motion_relax
 
-                sharp_enough = (lap_c >= (lap_thr_dyn + LAPLACE_MARGIN))
+                sharp_enough = (lap_c >= lap_thr_dyn) or (lap_c <= lap_low_dyn)
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
@@ -1101,8 +1110,10 @@ try:
 
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
-                    print(f"[stable?] mo={motion_ema:.4f} < {thr_enter:.4f} lap={lap_c:.1f} >= {lap_thr_dyn+LAPLACE_MARGIN:.1f} "
-                          f"dwell={(0 if presence_dwell_start is None else now-presence_dwell_start):.2f}/{PRESENCE_DWELL_S:.2f}")
+                    print(
+                        f"[stable?] mo={motion_ema:.4f} < {thr_enter:.4f} lap={lap_c:.1f} in [{lap_low_dyn:.1f},{lap_thr_dyn:.1f}]? "
+                        f"dwell={(0 if presence_dwell_start is None else now-presence_dwell_start):.2f}/{PRESENCE_DWELL_S:.2f}"
+                    )
 
                 if above_exit or not sharp_enough:
                     stable_count = 0
@@ -1121,7 +1132,7 @@ try:
                                 confirm_left -= 1
                                 if confirm_left == 0:
                                     tag = "expiry" if awaiting_expiry else (current_mode or "unknown_mode")
-                                    print(f"[mode] stable -> capturing ({tag})  mo={motion_ema:.4f}/{motion_thr_dyn:.4f} lap={lap_c:.1f}/{lap_thr_dyn+LAPLACE_MARGIN:.1f}")
+                                    print(f"[mode] stable -> capturing ({tag})  mo={motion_ema:.4f}/{motion_thr_dyn:.4f} lap={lap_c:.1f}/{lap_thr_dyn:.1f}")
                                     start_capture_thread(tag)
                                     if tag == "check_in":
                                         msg = "\u2713 CHECKED IN!"
@@ -1162,8 +1173,8 @@ try:
         # Re-arm when item is removed (center detail low for a few frames + min time)
         if need_clear:
             lap_c = center_laplacian(bgr)
-            clear_thr = max(PRESENCE_LAPLACE_MIN * 0.8, lap_thr_dyn * CLEAR_LAPLACE_FRAC)
-            if lap_c < clear_thr:
+            clear_margin = LAPLACE_MARGIN * CLEAR_LAPLACE_FRAC
+            if abs(lap_c - lap_baseline) <= clear_margin:
                 clear_count += 1
             else:
                 clear_count = 0
