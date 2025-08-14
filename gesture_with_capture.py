@@ -153,7 +153,7 @@ class EpaperUI:
                 elif kind == "captured":
                     m, ok, frac = payload
                     self._draw_captured(m, ok, frac)
-                elif kind == "expiry":       self._draw_expiry()
+                elif kind == "expiry":        self._draw_expiry()
                 elif kind == "timeout":       self._draw_main()
                 elif kind == "inventory":     self._draw_inventory(payload)
             except Exception as e:
@@ -243,6 +243,13 @@ class EpaperUI:
         d.text((x, y), text, font=font, fill=0)
         return (x, y, x + tw, y + th)
 
+    def _boxed_text(self, d, x, y, text, font, pad=4):
+        bbox = d.textbbox((0, 0), text, font=font)
+        w = bbox[2] - bbox[0]; h = bbox[3] - bbox[1]
+        d.rectangle((x - pad, y - pad, x + w + pad, y + h + pad), outline=0, fill=255)
+        d.text((x, y), text, font=font, fill=0)
+        return (x - pad, y - pad, x + w + pad, y + h + pad)
+
     # Screens
     def _draw_main(self):
         img, d = self._new_layer()
@@ -289,24 +296,19 @@ class EpaperUI:
             "opened": "Opened",
             "expiry": "Checking expiry...",
         }.get(mode, mode or "--")
-        self._centered_text(d, 6, title, self.font_big)
-        line1 = "hold items"
-        line2 = "1–2ft away from camera"
-        bbox1 = d.textbbox((0, 0), line1, font=self.font_italic)
-        bbox2 = d.textbbox((0, 0), line2, font=self.font_italic)
-        tw1, th1 = bbox1[2] - bbox1[0], bbox1[3] - bbox1[1]
-        tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
-        gap = 4
-        total_h = th1 + gap + th2
-        y0 = (self.H - total_h) // 2
-        d.text(((self.W - tw1) // 2, y0), line1, font=self.font_italic, fill=0)
-        d.text(((self.W - tw2) // 2, y0 + th1 + gap), line2, font=self.font_italic, fill=0)
 
-        # countdown bar
-        bar_h = 8
-        bar_y0 = self.H - bar_h - 4
-        d.rectangle((0, bar_y0, self.W, bar_y0 + bar_h), outline=0, fill=255)
-        d.rectangle((0, bar_y0, int(self.W * max(0.0, min(1.0, frac))), bar_y0 + bar_h), outline=0, fill=0)
+        # Top-center boxed mode
+        bbox = d.textbbox((0, 0), title, font=self.font_big)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = (self.W - tw) // 2
+        ty = 4
+        self._boxed_text(d, tx, ty, title, self.font_big, pad=6)
+
+        # Centered italic hint
+        line = "hold items 1–2ft away from camera"
+        bbox2 = d.textbbox((0, 0), line, font=self.font_italic)
+        tw2, th2 = bbox2[2] - bbox2[0], bbox2[3] - bbox2[1]
+        d.text(((self.W - tw2)//2, (self.H - th2)//2), line, font=self.font_italic, fill=0)
 
         self._push_partial(img)
 
@@ -316,15 +318,7 @@ class EpaperUI:
         bbox = d.textbbox((0, 0), banner, font=self.font_big)
         tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
         x = (self.W - tw)//2; y = (self.H - th)//2
-
-        d.text((x, y), banner, font=self.font_big, fill=0)
-
-        # countdown bar
-        bar_h = 8
-        bar_y0 = self.H - bar_h - 4
-        d.rectangle((0, bar_y0, self.W, bar_y0 + bar_h), outline=0, fill=255)
-        d.rectangle((0, bar_y0, int(self.W * max(0.0, min(1.0, frac))), bar_y0 + bar_h), outline=0, fill=0)
-
+        self._boxed_text(d, x, y, banner, self.font_big, pad=8)
         self._push_partial(img)
 
     def _draw_expiry(self):
@@ -619,6 +613,7 @@ EPD_UI.show_main()
 FRAME_W, FRAME_H = 640, 480
 LO_W, LO_H       = 192, 108
 
+# ROI for building histograms / presence
 ROI_Y0, ROI_Y1 = 0.25, 0.75
 ROI_X0, ROI_X1 = 0.25, 0.75
 
@@ -650,28 +645,27 @@ EXPIRY_WAIT_S = 8.0
 
 # Stability / thresholds
 WAIT_AFTER_SWIPE_S   = 1.0
-# slightly shorter window so we accept stabilization sooner
 STABILITY_WINDOW_FR  = 10
-MOTION_EMA_ALPHA     = 0.25              # single source of truth
+MOTION_EMA_ALPHA     = 0.25
 
+# Laplacian detail gates (relative to baseline at arming)
 PRESENCE_LAPLACE_MIN  = 6.0
-LAPLACE_MARGIN        = 8.0       # additive margin over baseline detail
+LAPLACE_MARGIN        = 8.0
 MAX_LAPLACE_THR       = 95.0
 
+# Motion gates (relative to baseline at arming)
 MOTION_THR_FLOOR = 0.004
 MAX_MOTION_THR   = 0.040
-MOTION_MARGIN    = 0.010        # additive margin over baseline motion
+MOTION_MARGIN    = 0.010
 
-# When users hold items very close for expiry capture, small hand tremors
-# look like large motion. Allow more motion tolerance in that scenario.
+# Expiry capture: allow more motion tolerance
 EXPIRY_MOTION_RELAX = 1.8
 
-STEADY_OVERRIDE_AFTER_S = 2.8            # safety valve
+STEADY_OVERRIDE_AFTER_S = 2.8
 
 ARM_TIMEOUT_S    = 8.0
 ENTER_RELAX      = 1.00
 EXIT_RELAX       = 1.20
-# allow a bit less dwell before treating as stable
 MIN_STABLE_S     = 0.35
 CONFIRM_FR       = 2
 
@@ -686,6 +680,11 @@ MIN_CLEAR_S        = 1.2
 PRESENCE_DWELL_S   = 0.60
 need_clear  = False
 clear_count = 0
+
+# ── NEW: Center bias & background guard
+CENTER_BIAS_SIGMA_X = 0.20
+CENTER_BIAS_SIGMA_Y = 0.20
+BACKGROUND_REJECT_RATIO = 1.25  # if background energy > center*1.25, ignore frame
 
 # Helpers
 def y_plane(yuv):
@@ -778,6 +777,14 @@ last_seen_t_x = last_seen_t_y = 0.0
 
 y0, y1 = int(ROI_Y0 * LO_H), int(ROI_Y1 * LO_H)
 x0, x1 = int(ROI_X0 * LO_W), int(ROI_X1 * LO_W)
+
+# Precompute Gaussian center weighting mask
+xs = np.linspace(0, 1, LO_W, dtype=np.float32)
+ys = np.linspace(0, 1, LO_H, dtype=np.float32)
+wx = np.exp(-0.5 * ((xs - 0.5) / CENTER_BIAS_SIGMA_X) ** 2)
+wy = np.exp(-0.5 * ((ys - 0.5) / CENTER_BIAS_SIGMA_Y) ** 2)
+W2D = np.outer(wy, wx)
+W2D /= W2D.max() + 1e-6
 
 MODE_MAP = {
     "SWIPE_RIGHT": "check_in",
@@ -875,8 +882,18 @@ try:
             for i in range(1, len(mask_pool)):
                 pooled = cv2.bitwise_or(pooled, mask_pool[i])
 
-            band_h = pooled[y0:y1, :]
-            col = band_h.astype(np.float32).sum(axis=0)
+            # Apply center bias
+            pooled_w = (pooled.astype(np.float32) * W2D).astype(np.float32)
+
+            # Background guard: measure center vs border energy
+            center_energy = float(pooled_w[y0:y1, x0:x1].sum())
+            total_energy  = float(pooled_w.sum())
+            border_energy = max(0.0, total_energy - center_energy)
+            background_dominates = (border_energy > center_energy * BACKGROUND_REJECT_RATIO)
+
+            # Build weighted histograms
+            band_h = pooled_w[y0:y1, :]
+            col = band_h.sum(axis=0)
             if col.sum() >= ENERGY_MIN_FRAC * (255.0 * (y1 - y0) * LO_W):
                 col_s = smooth1d(col, SMOOTH_COLS//2)
                 xs = np.arange(LO_W, dtype=np.float32)
@@ -889,8 +906,8 @@ try:
                     dbg[0:40, 0:FRAME_W] = cv2.resize(cv2.cvtColor(np.tile(bar, (40, 1)), cv2.COLOR_GRAY2BGR),(FRAME_W, 40))
                     cv2.line(dbg, (int(x_norm*FRAME_W), 40), (int(x_norm*FRAME_W), 70), (255,255,255), 2)
 
-            band_v = pooled[:, x0:x1]
-            row = band_v.astype(np.float32).sum(axis=1)
+            band_v = pooled_w[:, x0:x1]
+            row = band_v.sum(axis=1)
             if row.sum() >= ENERGY_MIN_FRAC * (255.0 * (x1 - x0) * LO_H):
                 row_s = smooth1d(row, SMOOTH_ROWS//2)
                 ys = np.arange(LO_H, dtype=np.float32)
@@ -906,10 +923,16 @@ try:
                     dbg[0:FRAME_H, FRAME_W-40:FRAME_W] = barv
                     cv2.line(dbg, (FRAME_W-40, int(y_norm*FRAME_H)), (FRAME_W, int(y_norm*FRAME_H)), (255,255,255), 2)
 
-            # Motion in central band
-            center_band = pooled[int(LO_H*0.20):int(LO_H*0.80), int(LO_W*0.20):int(LO_W*0.80)]
-            motion_now = float(center_band.sum()) / (255.0 * center_band.size)
+            # Motion in central band (weighted)
+            cb = pooled_w[int(LO_H*0.20):int(LO_H*0.80), int(LO_W*0.20):int(LO_W*0.80)]
+            motion_now = float(cb.sum()) / (255.0 * cb.size)
             motion_ema = motion_now if motion_ema is None else (MOTION_EMA_ALPHA * motion_now + (1.0 - MOTION_EMA_ALPHA) * motion_ema)
+
+            # If background dominates, ignore this frame for swipe logic
+            if background_dominates:
+                x_norm = None
+                y_norm = None
+                cv2.putText(dbg, "BG SKIP", (20, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
             # HUD motion bar
             m_norm = np.clip(motion_ema / 0.02, 0.0, 1.0)
@@ -927,12 +950,12 @@ try:
 
         span_x = vel_x = 0.0
         if len(trace_x) >= 2:
-            xs = [p[1] for p in trace_x]; ts = [p[0] for p in trace_x]
-            span_x = max(xs) - min(xs); dt = max(1e-3, ts[-1]-ts[0]); vel_x = (xs[-1]-xs[0])/dt
+            xs2 = [p[1] for p in trace_x]; ts = [p[0] for p in trace_x]
+            span_x = max(xs2) - min(xs2); dt = max(1e-3, ts[-1]-ts[0]); vel_x = (xs2[-1]-xs2[0])/dt
         span_y = vel_y = 0.0
         if len(trace_y) >= 2:
-            ys = [p[1] for p in trace_y]; ts2 = [p[0] for p in trace_y]
-            span_y = max(ys) - min(ys); dt2 = max(1e-3, ts2[-1]-ts2[0]); vel_y = (ys[-1]-ys[0])/dt2
+            ys2 = [p[1] for p in trace_y]; ts2 = [p[0] for p in trace_y]
+            span_y = max(ys2) - min(ys2); dt2 = max(1e-3, ts2[-1]-ts2[0]); vel_y = (ys2[-1]-ys2[0])/dt2
 
         # Mode setting
         gesture_text = ""
@@ -1076,14 +1099,7 @@ try:
                 stable_count = 0
                 presence_dwell_start = None
             else:
-                # update countdown bar roughly each second
-                if (now - last_capture_t) > 0.5:
-                    sec = int(remaining)
-                    if sec != countdown_last_sec:
-                        countdown_last_sec = sec
-                        display_mode = "expiry" if awaiting_expiry else current_mode
-                        EPD_UI.show_mode_prompt(display_mode, remaining / total)
-
+                # (We keep the countdown logic internal; UI prompt stays simple/boxed.)
                 lap_c = center_laplacian(bgr)
                 motion_relax = EXPIRY_MOTION_RELAX if awaiting_expiry else 1.0
                 thr_enter = motion_base + MOTION_MARGIN * ENTER_RELAX * motion_relax
@@ -1096,7 +1112,7 @@ try:
                 if above_exit:
                     motion_since_arm = True
 
-                # Safety valve (optional): very steady for a while → let sharpness slide
+                # Safety valve: very steady for a while → let sharpness slide
                 if (not sharp_enough) and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
                     sharp_enough = True
                     print("[stable?] overriding sharpness due to sustained steadiness")
@@ -1170,7 +1186,7 @@ try:
                                         clear_count = 0
                                         print("[mode] captured; waiting for item removal to re-arm")
 
-        # Re-arm when item is removed (center detail low for a few frames + min time)
+        # Re-arm when item is removed (center detail ~ baseline for a few frames)
         if need_clear:
             lap_c = center_laplacian(bgr)
             clear_margin = LAPLACE_MARGIN * CLEAR_LAPLACE_FRAC
@@ -1207,7 +1223,7 @@ try:
             cv2.putText(dbg, gesture_text, (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
 
         if not HEADLESS:
-            cv2.imshow("Swipe -> Mode -> Stable capture (adaptive)", dbg)
+            cv2.imshow("Swipe -> Mode -> Stable capture (center-weighted)", dbg)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
         else:
