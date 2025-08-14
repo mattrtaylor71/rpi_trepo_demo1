@@ -658,9 +658,9 @@ PRESENCE_LAPLACE_MIN  = 6.0
 LAPLACE_MARGIN        = 8.0       # additive margin over baseline detail
 MAX_LAPLACE_THR       = 95.0
 
-MOTION_THR_SCALE = 1.5
 MOTION_THR_FLOOR = 0.004
 MAX_MOTION_THR   = 0.040
+MOTION_MARGIN    = 0.010        # additive margin over baseline motion
 
 # When users hold items very close for expiry capture, small hand tremors
 # look like large motion. Allow more motion tolerance in that scenario.
@@ -801,6 +801,7 @@ inventory_last_draw = 0.0
 
 motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
+motion_base = MOTION_THR_FLOOR
 lap_baseline = 0.0
 lap_thr_dyn  = PRESENCE_LAPLACE_MIN
 lap_low_dyn  = 0.0
@@ -808,9 +809,9 @@ lap_low_dyn  = 0.0
 FLIP_X = True
 FLIP_Y = False
 
-def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
+def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None, motion_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
-    global motion_thr_dyn, lap_baseline, lap_thr_dyn, lap_low_dyn
+    global motion_thr_dyn, motion_base, lap_baseline, lap_thr_dyn, lap_low_dyn
     global need_clear, stable_since, confirm_left, presence_dwell_start
     global motion_since_arm
     global countdown_last_sec, awaiting_expiry, expiry_prompt_time
@@ -838,7 +839,16 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     lap_thr_dyn = min(lap_thr_dyn, MAX_LAPLACE_THR)
     lap_low_dyn = max(0.0, lap_baseline - LAPLACE_MARGIN)
 
-    print(f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f}  lap_hi={lap_thr_dyn:.1f}  lap_lo={lap_low_dyn:.1f}")
+    if motion_for_baseline is not None:
+        motion_base = motion_for_baseline
+    else:
+        motion_base = MOTION_THR_FLOOR
+    motion_thr_dyn = min(MAX_MOTION_THR, motion_base + MOTION_MARGIN)
+
+    print(
+        f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f} lap_hi={lap_thr_dyn:.1f} lap_lo={lap_low_dyn:.1f} "
+        f"mo_base={motion_base:.4f} mo_thr={motion_thr_dyn:.4f}"
+    )
 
 try:
     while True:
@@ -929,7 +939,7 @@ try:
         can_fire = (now - last_fire) > COOLDOWN_S
 
         def handle_gesture(gesture: str):
-            global motion_thr_dyn, inventory_mode, inventory_rows, inventory_idx
+            global inventory_mode, inventory_rows, inventory_idx
             global inventory_last_gesture, inventory_last_draw, current_mode
             if inventory_mode:
                 inventory_last_gesture = now
@@ -970,8 +980,7 @@ try:
                     inventory_last_draw = now
                     return
                 ema = (motion_ema if motion_ema is not None else MOTION_THR_FLOOR)
-                motion_thr_dyn = max(MOTION_THR_FLOOR, min(MAX_MOTION_THR, ema * MOTION_THR_SCALE))
-                set_mode_from(gesture, now_ts, bgr_for_baseline=bgr)
+                set_mode_from(gesture, now_ts, bgr_for_baseline=bgr, motion_for_baseline=ema)
                 EPD_UI.show_mode_prompt(current_mode, 1.0)
                 cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
@@ -1077,8 +1086,9 @@ try:
 
                 lap_c = center_laplacian(bgr)
                 motion_relax = EXPIRY_MOTION_RELAX if awaiting_expiry else 1.0
-                thr_enter = motion_thr_dyn * ENTER_RELAX * motion_relax
-                thr_exit  = motion_thr_dyn * EXIT_RELAX * motion_relax
+                thr_enter = motion_base + MOTION_MARGIN * ENTER_RELAX * motion_relax
+                thr_exit  = motion_base + MOTION_MARGIN * EXIT_RELAX * motion_relax
+
                 sharp_enough = (lap_c >= lap_thr_dyn) or (lap_c <= lap_low_dyn)
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
