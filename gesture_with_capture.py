@@ -803,13 +803,14 @@ motion_ema = None
 motion_thr_dyn = MOTION_THR_FLOOR
 lap_baseline = 0.0
 lap_thr_dyn  = PRESENCE_LAPLACE_MIN
+lap_low_dyn  = 0.0
 
 FLIP_X = True
 FLIP_Y = False
 
 def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
-    global motion_thr_dyn, lap_baseline, lap_thr_dyn
+    global motion_thr_dyn, lap_baseline, lap_thr_dyn, lap_low_dyn
     global need_clear, stable_since, confirm_left, presence_dwell_start
     global motion_since_arm
     global countdown_last_sec, awaiting_expiry, expiry_prompt_time
@@ -835,8 +836,9 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
         lap_baseline = 0.0
     lap_thr_dyn = max(PRESENCE_LAPLACE_MIN, lap_baseline + LAPLACE_MARGIN)
     lap_thr_dyn = min(lap_thr_dyn, MAX_LAPLACE_THR)
+    lap_low_dyn = max(0.0, lap_baseline - LAPLACE_MARGIN)
 
-    print(f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f}  lap_thr={lap_thr_dyn:.1f}")
+    print(f"[mode] {current_mode} (armed)  lap_base={lap_baseline:.1f}  lap_hi={lap_thr_dyn:.1f}  lap_lo={lap_low_dyn:.1f}")
 
 try:
     while True:
@@ -1077,8 +1079,7 @@ try:
                 motion_relax = EXPIRY_MOTION_RELAX if awaiting_expiry else 1.0
                 thr_enter = motion_thr_dyn * ENTER_RELAX * motion_relax
                 thr_exit  = motion_thr_dyn * EXIT_RELAX * motion_relax
-
-                sharp_enough = (lap_c >= lap_thr_dyn)
+                sharp_enough = (lap_c >= lap_thr_dyn) or (lap_c <= lap_low_dyn)
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
@@ -1100,7 +1101,7 @@ try:
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
                     print(
-                        f"[stable?] mo={motion_ema:.4f} < {thr_enter:.4f} lap={lap_c:.1f} >= {lap_thr_dyn:.1f} "
+                        f"[stable?] mo={motion_ema:.4f} < {thr_enter:.4f} lap={lap_c:.1f} in [{lap_low_dyn:.1f},{lap_thr_dyn:.1f}]? "
                         f"dwell={(0 if presence_dwell_start is None else now-presence_dwell_start):.2f}/{PRESENCE_DWELL_S:.2f}"
                     )
 
@@ -1162,8 +1163,8 @@ try:
         # Re-arm when item is removed (center detail low for a few frames + min time)
         if need_clear:
             lap_c = center_laplacian(bgr)
-            clear_thr = max(PRESENCE_LAPLACE_MIN * 0.8, lap_thr_dyn * CLEAR_LAPLACE_FRAC)
-            if lap_c < clear_thr:
+            clear_margin = LAPLACE_MARGIN * CLEAR_LAPLACE_FRAC
+            if abs(lap_c - lap_baseline) <= clear_margin:
                 clear_count += 1
             else:
                 clear_count = 0
