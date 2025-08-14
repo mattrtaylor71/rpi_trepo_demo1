@@ -1,4 +1,4 @@
-import time, os, collections, threading, queue, base64, datetime, csv
+import time, os, collections, threading, queue, base64, datetime, csv, re
 import numpy as np
 import cv2
 from picamera2 import Picamera2
@@ -247,48 +247,37 @@ class EpaperUI:
     def _draw_main(self):
         img, d = self._new_layer()
 
-        s = 14
+        s = 8
         mid_x = self.W // 2
         mid_y = self.H // 2
-        gap = 4
+        offset = s + 12
 
-        # Left/right arrows near center
-        self._arrow(d, x=mid_x - gap - s, y=mid_y, size=s, direction="left")
-        self._arrow(d, x=mid_x + gap + s, y=mid_y, size=s, direction="right")
+        # Arrows equally spaced around center
+        self._arrow(d, x=mid_x - offset, y=mid_y, size=s, direction="left")
+        self._arrow(d, x=mid_x + offset, y=mid_y, size=s, direction="right")
+        self._arrow(d, x=mid_x, y=mid_y - offset, size=s, direction="up")
+        self._arrow(d, x=mid_x, y=mid_y + offset, size=s, direction="down")
 
-        # Vertical labels on edges with small inset and padding to avoid clipping
-        inset = 2
+        # Labels (all horizontal)
         label = "Discard"
         bbox = d.textbbox((0, 0), label, font=self.font_sm)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        timg = _Image.new('1', (tw + 2, th + 2), 255)
-        td = _Draw.Draw(timg)
-        td.text((1, 1), label, font=self.font_sm, fill=0)
-        timg = timg.rotate(90, expand=True)
-        img.paste(timg, (inset, (self.H - timg.height) // 2))
+        d.text((mid_x - offset - s - tw - 4, mid_y - th // 2), label, font=self.font_sm, fill=0)
 
         label = "Check-in"
         bbox = d.textbbox((0, 0), label, font=self.font_sm)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        timg = _Image.new('1', (tw + 2, th + 2), 255)
-        td = _Draw.Draw(timg)
-        td.text((1, 1), label, font=self.font_sm, fill=0)
-        timg = timg.rotate(270, expand=True)
-        img.paste(timg, (self.W - timg.width - inset, (self.H - timg.height) // 2))
+        d.text((mid_x + offset + s + 4, mid_y - th // 2), label, font=self.font_sm, fill=0)
 
-        # Up arrow + label
-        y = 10 + s
-        self._arrow(d, x=mid_x, y=y, size=s, direction="up")
-        bbox = d.textbbox((0, 0), "Inventory", font=self.font_sm)
-        tw = bbox[2] - bbox[0]
-        d.text((mid_x - tw // 2, y - s - 12), "Inventory", font=self.font_sm, fill=0)
+        label = "Inventory"
+        bbox = d.textbbox((0, 0), label, font=self.font_sm)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        d.text((mid_x - tw // 2, mid_y - offset - s - th - 4), label, font=self.font_sm, fill=0)
 
-        # Down arrow + label
-        y = self.H - 10 - s
-        self._arrow(d, x=mid_x, y=y, size=s, direction="down")
-        bbox = d.textbbox((0, 0), "Opened", font=self.font_sm)
-        tw = bbox[2] - bbox[0]
-        d.text((mid_x - tw // 2, y + s + 4), "Opened", font=self.font_sm, fill=0)
+        label = "Opened"
+        bbox = d.textbbox((0, 0), label, font=self.font_sm)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        d.text((mid_x - tw // 2, mid_y + offset + s + 4), label, font=self.font_sm, fill=0)
 
         self._push_partial(img)
 
@@ -373,7 +362,16 @@ class EpaperUI:
             y += 4
             self._centered_text(d, y, f"expiry: {item.get('expiry', '')}", self.font_sm)
             y += 16
-            opened = item.get('opened_date') or "--"
+            opened_date = item.get('opened_date')
+            if opened_date:
+                try:
+                    od = datetime.date.fromisoformat(opened_date)
+                    days = (datetime.date.today() - od).days
+                    opened = "today" if days == 0 else f"{days} day{'s' if days != 1 else ''} ago"
+                except Exception:
+                    opened = opened_date
+            else:
+                opened = "--"
             self._centered_text(d, y, f"opened: {opened}", self.font_sm)
 
         # Scroll arrows
@@ -441,10 +439,40 @@ def save_inventory(rows):
         writer.writeheader()
         writer.writerows(rows)
 
+def _parse_date_safe(s):
+    try:
+        return datetime.date.fromisoformat(s)
+    except Exception:
+        return datetime.date.max
+
+def normalize_expiry_date(text):
+    text = (text or "").strip()
+    m_year = re.search(r"(20\d{2})", text)
+    if not m_year:
+        return text
+    year = int(m_year.group(1))
+    rest = re.sub(m_year.group(1), "", text, count=1)
+    digits = re.findall(r"\d+", rest)
+    month = int(digits[0]) if digits else 1
+    day = int(digits[1]) if len(digits) > 1 else 1
+    if month > 12 and day <= 12:
+        month, day = day, month
+    try:
+        dt = datetime.date(year, max(1, min(month, 12)), max(1, min(day, 31)))
+        return dt.isoformat()
+    except Exception:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+
+def sort_inventory_by_expiry(rows):
+    for r in rows:
+        r["expiry"] = normalize_expiry_date(r.get("expiry", ""))
+    rows.sort(key=lambda r: _parse_date_safe(r.get("expiry", "")))
+    return rows
+
 def add_inventory_item(name, expiry):
     with inventory_lock:
         rows = load_inventory()
-        rows.append({"name": name, "expiry": expiry, "state": "sealed", "opened_date": ""})
+        rows.append({"name": name, "expiry": normalize_expiry_date(expiry), "state": "sealed", "opened_date": ""})
         save_inventory(rows)
 
 def match_inventory_item(query_name, inventory_names, client):
@@ -492,8 +520,9 @@ def handle_openai_result(tag, text, client):
         print(f"[inventory] pending: {pending_item_name}")
     elif tag == "expiry":
         if pending_item_name:
-            add_inventory_item(pending_item_name, text)
-            print(f"[inventory] added: {pending_item_name} exp {text}")
+            iso = normalize_expiry_date(text)
+            add_inventory_item(pending_item_name, iso)
+            print(f"[inventory] added: {pending_item_name} exp {iso}")
             pending_item_name = None
         else:
             print(f"[inventory] no pending item for expiry '{text}'")
@@ -529,7 +558,8 @@ def api_worker():
                 system_text = (
                     "You are an expert at reading expiration dates from product photos. "
                     "Think carefully and use intuition to choose the most plausible date, "
-                    "even if the numbers are grainy. Respond with the date only."
+                    "even if the numbers are grainy. Respond with the date only in the YYYY-MM-DD format. "
+                    "If the day is missing, use the first of that month."
                 )
             else:
                 user_text = f"Identify the object. (mode={tag})"
@@ -642,13 +672,14 @@ STEADY_OVERRIDE_AFTER_S = 2.8            # safety valve
 ARM_TIMEOUT_S    = 8.0
 ENTER_RELAX      = 1.00
 EXIT_RELAX       = 1.20
-# reduce required stable duration to be a bit more sensitive
-MIN_STABLE_S     = 0.40
+# allow a bit less dwell before treating as stable
+MIN_STABLE_S     = 0.35
 CONFIRM_FR       = 2
 
 stable_since = None
 confirm_left = 0
 presence_dwell_start = None
+motion_since_arm = False
 
 CLEAR_LAPLACE_FRAC = 0.75
 CLEAR_WINDOW_FR    = 10
@@ -781,6 +812,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     global current_mode, armed, arm_time, stable_count
     global motion_thr_dyn, lap_baseline, lap_thr_dyn
     global need_clear, stable_since, confirm_left, presence_dwell_start
+    global motion_since_arm
     global countdown_last_sec, awaiting_expiry, expiry_prompt_time
 
     m = MODE_MAP.get(gesture)
@@ -796,6 +828,7 @@ def set_mode_from(gesture: str, now_ts: float, bgr_for_baseline=None):
     stable_since = None
     confirm_left = 0
     presence_dwell_start = None
+    motion_since_arm = False
 
     if bgr_for_baseline is not None:
         lap_baseline = center_laplacian(bgr_for_baseline)
@@ -897,21 +930,22 @@ try:
 
         def handle_gesture(gesture: str):
             global motion_thr_dyn, inventory_mode, inventory_rows, inventory_idx
-            global inventory_last_gesture, inventory_last_draw
+            global inventory_last_gesture, inventory_last_draw, current_mode
             if inventory_mode:
                 inventory_last_gesture = now
                 if gesture == "SWIPE_LEFT":
                     if inventory_rows:
-                        inventory_idx = (inventory_idx + 1) % len(inventory_rows)
+                        inventory_idx = (inventory_idx - 1) % len(inventory_rows)
                         EPD_UI.clear_queue()
                 elif gesture == "SWIPE_RIGHT":
                     if inventory_rows:
-                        inventory_idx = (inventory_idx - 1) % len(inventory_rows)
+                        inventory_idx = (inventory_idx + 1) % len(inventory_rows)
                         EPD_UI.clear_queue()
                 elif gesture == "SWIPE_DOWN":
                     inventory_mode = False
                     EPD_UI.clear_queue()
                     EPD_UI.show_main()
+                    current_mode = None
                     return
                 else:
                     return
@@ -920,8 +954,12 @@ try:
                 EPD_UI.show_inventory(item, frac)
                 inventory_last_draw = now
             else:
+                # Only interpret swipes as mode changes when on the main screen
+                if current_mode is not None:
+                    return
                 if gesture == "SWIPE_UP":
-                    inventory_rows = load_inventory()
+                    inventory_rows = sort_inventory_by_expiry(load_inventory())
+                    save_inventory(inventory_rows)
                     inventory_idx = 0
                     inventory_last_gesture = now
                     inventory_mode = True
@@ -978,6 +1016,7 @@ try:
                 inventory_mode = False
                 EPD_UI.clear_queue()
                 EPD_UI.show_main()
+                current_mode = None
             elif (now - inventory_last_draw) > 0.5:
                 inventory_last_draw = now
                 item = inventory_rows[inventory_idx] if inventory_rows else None
@@ -1013,13 +1052,16 @@ try:
                     stable_since = None
                     confirm_left = 0
                     presence_dwell_start = None
+                    motion_since_arm = False
                     countdown_last_sec = -1
                     EPD_UI.show_captured("expiry", "NO EXPIRY", 1.0)
                 else:
                     print("[mode] timeout; disarming without capture")
                     EPD_UI.show_timeout()
+                    current_mode = None
                     armed = False
                     presence_dwell_start = None
+                    motion_since_arm = False
                     countdown_last_sec = -1
             elif (now - arm_time) < WAIT_AFTER_SWIPE_S:
                 stable_count = 0
@@ -1042,19 +1084,20 @@ try:
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
 
-                # Presence dwell: start timing only when BOTH gates are met
-                if below_enter and sharp_enough:
-                    if presence_dwell_start is None:
-                        presence_dwell_start = now
-                else:
-                    presence_dwell_start = None
+                if above_exit:
+                    motion_since_arm = True
 
                 # Safety valve (optional): very steady for a while → let sharpness slide
                 if (not sharp_enough) and below_enter and (now - arm_time) > STEADY_OVERRIDE_AFTER_S:
                     sharp_enough = True
-                    if presence_dwell_start is None:
-                        presence_dwell_start = now  # begin dwell from now
                     print("[stable?] overriding sharpness due to sustained steadiness")
+
+                # Presence dwell: require motion since arming and both gates
+                if motion_since_arm and below_enter and sharp_enough:
+                    if presence_dwell_start is None:
+                        presence_dwell_start = now
+                else:
+                    presence_dwell_start = None
 
                 # Debug
                 if int(time.time() * 5) % 5 == 0:
@@ -1094,6 +1137,7 @@ try:
                                     stable_count = 0
                                     stable_since = None
                                     presence_dwell_start = None
+                                    motion_since_arm = False
                                     if awaiting_expiry:
                                         awaiting_expiry = False
                                         need_clear = True
@@ -1131,6 +1175,7 @@ try:
                 arm_time = now
                 countdown_last_sec = -1
                 presence_dwell_start = None
+                motion_since_arm = False
                 print("[mode] scene cleared; re-armed")
                 if current_mode:
                     EPD_UI.show_mode_prompt(current_mode, 1.0)
