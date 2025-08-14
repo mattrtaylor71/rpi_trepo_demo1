@@ -904,6 +904,7 @@ try:
                     inventory_mode = False
                     EPD_UI.clear_queue()
                     EPD_UI.show_main()
+                    current_mode = None
                     return
                 else:
                     return
@@ -973,6 +974,7 @@ try:
                 inventory_mode = False
                 EPD_UI.clear_queue()
                 EPD_UI.show_main()
+                current_mode = None
             elif (now - inventory_last_draw) > 0.5:
                 inventory_last_draw = now
                 item = inventory_rows[inventory_idx] if inventory_rows else None
@@ -1014,6 +1016,7 @@ try:
                 else:
                     print("[mode] timeout; disarming without capture")
                     EPD_UI.show_timeout()
+                    current_mode = None
                     armed = False
                     presence_dwell_start = None
                     motion_since_arm = False
