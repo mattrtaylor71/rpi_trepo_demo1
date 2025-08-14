@@ -1079,7 +1079,6 @@ try:
                 motion_relax = EXPIRY_MOTION_RELAX if awaiting_expiry else 1.0
                 thr_enter = motion_thr_dyn * ENTER_RELAX * motion_relax
                 thr_exit  = motion_thr_dyn * EXIT_RELAX * motion_relax
-
                 sharp_enough = (lap_c >= lap_thr_dyn) or (lap_c <= lap_low_dyn)
                 below_enter  = (motion_ema is not None) and (motion_ema < thr_enter)
                 above_exit   = (motion_ema is not None) and (motion_ema > thr_exit)
