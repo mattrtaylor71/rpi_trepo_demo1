@@ -3,10 +3,10 @@
 
 This script streams frames from a Raspberry Pi camera (Picamera2 when
 available, otherwise OpenCV) and watches for a new object entering the
-scene. Once the view stabilises for a short period the script captures a
-high‑resolution still image, segments the plate contents and estimates the
-volume of each detected food blob. Each blob is then classified using an
-OpenAI vision model to provide a short food label.
+scene. Once the view stabilises for a short period the current frame is
+analysed: the plate contents are segmented, each food blob is classified via
+an OpenAI vision model and the estimated volume is drawn over the camera
+stream.
 
 The table is expected to include a DICT_4X4_50 ArUco marker with ID 0 to
 derive a millimetres‑per‑pixel scale for volume estimates.
@@ -19,8 +19,6 @@ import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-
-
 import cv2
 import numpy as np
 
@@ -34,7 +32,6 @@ except Exception:  # pragma: no cover
 # Configuration
 # ---------------------------------------------------------------------------
 FRAME_W, FRAME_H = 640, 480
-STILL_W, STILL_H = 2304, 1296
 STABLE_FRAMES = 15
 MOTION_ENTER_THR = 15.0  # percentage of pixels that must change to trigger
 MOTION_STABLE_THR = 2.0   # percentage of pixels allowed to change when stable
@@ -50,8 +47,6 @@ ASSUMED_HEIGHT_MM = 10    # assumed height of food for volume estimation
 @dataclass
 class Camera:
     picam2: Optional[Picamera2]
-    video_cfg: Optional[object]
-    still_cfg: Optional[object]
     cap: Optional[cv2.VideoCapture]
 
 
@@ -60,20 +55,17 @@ def create_camera() -> Camera:
 
     if Picamera2 is not None:
         picam2 = Picamera2()
-        video_cfg = picam2.create_video_configuration(
+        config = picam2.create_video_configuration(
             main={"format": "RGB888", "size": (FRAME_W, FRAME_H)}
         )
-        still_cfg = picam2.create_still_configuration(
-            main={"format": "RGB888", "size": (STILL_W, STILL_H)}, display=None
-        )
-        picam2.configure(video_cfg)
+        picam2.configure(config)
         picam2.start()
-        return Camera(picam2=picam2, video_cfg=video_cfg, still_cfg=still_cfg, cap=None)
+        return Camera(picam2=picam2, cap=None)
 
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    return Camera(picam2=None, video_cfg=None, still_cfg=None, cap=cap)
+    return Camera(picam2=None, cap=cap)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +140,13 @@ def segment_food(frame: np.ndarray, plate_mask: np.ndarray) -> List[np.ndarray]:
     return [c for c in contours if cv2.contourArea(c) > 500]
 
 
+@dataclass
+class BlobResult:
+    label: str
+    volume_ml: float
+    bbox: Tuple[int, int, int, int]
+
+
 def classify_blob(img: np.ndarray) -> str:
     """Classify a blob image using an OpenAI vision model."""
 
@@ -179,25 +178,47 @@ def classify_blob(img: np.ndarray) -> str:
     except Exception:
         return "unknown"
 
+def analyse_plate(frame: np.ndarray) -> Tuple[np.ndarray, List[BlobResult]]:
+    """Analyse the plate and return an annotated frame and blob info."""
 
-def analyse_plate(frame: np.ndarray) -> None:
-    """Analyse the plate for food blobs and print volumes."""
+    output = frame.copy()
+    results: List[BlobResult] = []
 
     scale = mm_per_pixel(frame)
     if scale is None:
-        print("ArUco marker ID 0 not found; cannot compute volume")
-        return
+        cv2.putText(
+            output,
+            "ArUco marker ID 0 not found",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255),
+            2,
+        )
+        return output, results
 
     mask = find_plate_mask(frame)
     blobs = segment_food(frame, mask)
-    for i, cnt in enumerate(blobs, 1):
+    for cnt in blobs:
         area_px = cv2.contourArea(cnt)
         area_mm2 = area_px * (scale ** 2)
         volume_ml = (area_mm2 * ASSUMED_HEIGHT_MM) / 1000.0
         x, y, w, h = cv2.boundingRect(cnt)
         crop = frame[y : y + h, x : x + w]
         label = classify_blob(crop)
-        print(f"Blob {i}: {label} ~ {volume_ml:.1f} mL")
+        results.append(BlobResult(label=label, volume_ml=volume_ml, bbox=(x, y, w, h)))
+        cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(
+            output,
+            f"{label}: {volume_ml:.1f} mL",
+            (x, y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            2,
+        )
+
+    return output, results
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +231,8 @@ def main() -> None:
     prev: Optional[np.ndarray] = None
     stable_count = 0
     armed = False
+    overlay: Optional[np.ndarray] = None
+    overlay_until = 0.0
 
     try:
         while True:
@@ -228,6 +251,8 @@ def main() -> None:
             mp = motion_percent(prev, frame)
             prev = frame
 
+            if time.time() > overlay_until:
+                overlay = None
             if not armed and mp > MOTION_ENTER_THR:
                 armed = True
                 stable_count = 0
@@ -239,23 +264,16 @@ def main() -> None:
                     stable_count = 0
 
                 if stable_count >= STABLE_FRAMES:
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    filename = f"plate_{ts}.jpg"
-                    if cam.picam2 is not None:
-                        cam.picam2.switch_mode(cam.still_cfg)
-                        time.sleep(0.2)
-                        still = cam.picam2.capture_array()
-                        cam.picam2.switch_mode(cam.video_cfg)
-                        cv2.imwrite(filename, cv2.cvtColor(still, cv2.COLOR_RGB2BGR))
-                    else:
-                        still = frame
-                        cv2.imwrite(filename, cv2.cvtColor(still, cv2.COLOR_RGB2BGR))
-                    print(f"Saved {filename}")
-                    analyse_plate(still)
+                    annotated, infos = analyse_plate(frame)
+                    for i, info in enumerate(infos, 1):
+                        print(f"Blob {i}: {info.label} ~ {info.volume_ml:.1f} mL")
+                    overlay = annotated
+                    overlay_until = time.time() + 3.0
                     armed = False
                     stable_count = 0
 
-            cv2.imshow("cafeteria", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            display = overlay if overlay is not None else frame
+            cv2.imshow("cafeteria", cv2.cvtColor(display, cv2.COLOR_RGB2BGR))
             if cv2.waitKey(1) == 27:
                 break
 
