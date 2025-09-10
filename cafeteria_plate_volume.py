@@ -1,3 +1,4 @@
+
 """Cafeteria plate analysis with motion based capture.
 
 This script streams frames from a Raspberry Pi camera (Picamera2 when
@@ -18,7 +19,6 @@ import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-
 import cv2
 import numpy as np
 
@@ -178,7 +178,6 @@ def classify_blob(img: np.ndarray) -> str:
     except Exception:
         return "unknown"
 
-
 def analyse_plate(frame: np.ndarray) -> Tuple[np.ndarray, List[BlobResult]]:
     """Analyse the plate and return an annotated frame and blob info."""
 
@@ -254,7 +253,6 @@ def main() -> None:
 
             if time.time() > overlay_until:
                 overlay = None
-
             if not armed and mp > MOTION_ENTER_THR:
                 armed = True
                 stable_count = 0
@@ -289,4 +287,3 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
