@@ -1,3 +1,4 @@
+
 """Simple object dimension estimation using an ArUco marker.
 
 This script streams frames from a Raspberry Pi camera and watches for a new
@@ -8,11 +9,9 @@ and height of the object are drawn on the camera stream.
 """
 
 from __future__ import annotations
-
 import time
 from dataclasses import dataclass
 from typing import Optional
-
 import cv2
 import numpy as np
 
@@ -62,7 +61,6 @@ def create_camera() -> Camera:
 
 
 # ---------------------------------------------------------------------------
-# Utility functions
 # ---------------------------------------------------------------------------
 
 
@@ -75,8 +73,6 @@ def motion_percent(prev: np.ndarray, curr: np.ndarray) -> float:
     _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
     changed = np.count_nonzero(thresh)
     return changed * 100.0 / thresh.size
-
-
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 
 
@@ -205,4 +201,3 @@ def main() -> None:  # pragma: no cover - relies on camera hardware
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
