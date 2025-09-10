@@ -1,24 +1,17 @@
 
-"""Cafeteria plate analysis with motion based capture.
+"""Simple object dimension estimation using an ArUco marker.
 
-This script streams frames from a Raspberry Pi camera (Picamera2 when
-available, otherwise OpenCV) and watches for a new object entering the
-scene. Once the view stabilises for a short period the current frame is
-analysed: the plate contents are segmented, each food blob is classified via
-an OpenAI vision model and the estimated volume is drawn over the camera
-stream.
-
-The table is expected to include a DICT_4X4_50 ArUco marker with ID 0 to
-derive a millimetres‑per‑pixel scale for volume estimates.
+This script streams frames from a Raspberry Pi camera and watches for a new
+object placed on a static background. Once the view stabilises the largest
+foreground object is measured. The size of an ArUco marker (DICT_4X4_50, ID 0)
+on the table is used to convert pixels to millimetres and the resulting width
+and height of the object are drawn on the camera stream.
 """
 
 from __future__ import annotations
-
-import base64
-import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional
 import cv2
 import numpy as np
 
@@ -33,10 +26,9 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 FRAME_W, FRAME_H = 640, 480
 STABLE_FRAMES = 15
-MOTION_ENTER_THR = 15.0  # percentage of pixels that must change to trigger
-MOTION_STABLE_THR = 2.0   # percentage of pixels allowed to change when stable
-ARUCO_MARKER_MM = 40      # physical size of the ID 0 marker
-ASSUMED_HEIGHT_MM = 10    # assumed height of food for volume estimation
+FG_AREA_ENTER = 5000  # pixels of foreground to trigger detection
+MOTION_STABLE_THR = 2.0  # percent motion allowed when stable
+ARUCO_MARKER_MM = 40  # physical size of the ID 0 marker
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +61,11 @@ def create_camera() -> Camera:
 
 
 # ---------------------------------------------------------------------------
-# Motion detection
 # ---------------------------------------------------------------------------
 
 
 def motion_percent(prev: np.ndarray, curr: np.ndarray) -> float:
-    """Return percentage of pixels that changed between the two frames."""
+    """Return percentage of pixels that changed between two frames."""
 
     gray_prev = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
     gray_curr = cv2.cvtColor(curr, cv2.COLOR_RGB2GRAY)
@@ -82,13 +73,6 @@ def motion_percent(prev: np.ndarray, curr: np.ndarray) -> float:
     _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
     changed = np.count_nonzero(thresh)
     return changed * 100.0 / thresh.size
-
-
-# ---------------------------------------------------------------------------
-# Plate / food processing
-# ---------------------------------------------------------------------------
-
-
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 
 
@@ -113,125 +97,16 @@ def mm_per_pixel(frame: np.ndarray) -> Optional[float]:
     return None
 
 
-def find_plate_mask(frame: np.ndarray) -> np.ndarray:
-    """Approximate the plate as the largest contour."""
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return np.zeros_like(gray)
-    plate = max(contours, key=cv2.contourArea)
-    mask = np.zeros_like(gray)
-    cv2.drawContours(mask, [plate], -1, 255, -1)
-    return mask
-
-
-def segment_food(frame: np.ndarray, plate_mask: np.ndarray) -> List[np.ndarray]:
-    """Return contours for food blobs inside the plate using background subtraction."""
-
-    # Extract the plate region and model a smooth background of the plate using
-    # a large median blur.  Differences from this background correspond to food
-    # items and other irregularities on the plate surface.
-    plate = cv2.bitwise_and(frame, frame, mask=plate_mask)
-    background = cv2.medianBlur(plate, 21)
-    diff = cv2.absdiff(plate, background)
-
-    gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
-    _, food = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
-    food = cv2.morphologyEx(food, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    contours, _ = cv2.findContours(food, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return [c for c in contours if cv2.contourArea(c) > 500]
-
-
-@dataclass
-class BlobResult:
-    label: str
-    volume_ml: float
-    bbox: Tuple[int, int, int, int]
-
-
-def classify_blob(img: np.ndarray) -> str:
-    """Classify a blob image using an OpenAI vision model."""
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return "unknown"
-
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key)
-        ok, buf = cv2.imencode(".png", img)
-        if not ok:
-            return "unknown"
-        b64 = base64.b64encode(buf).decode("utf-8")
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Identify the food in this image."},
-                        {"type": "image", "image_base64": b64},
-                    ],
-                }
-            ],
-        )
-        return resp.output[0].content[0].text.strip()
-    except Exception:
-        return "unknown"
-def analyse_plate(frame: np.ndarray) -> Tuple[np.ndarray, List[BlobResult]]:
-    """Analyse the plate and return an annotated frame and blob info."""
-
-    output = frame.copy()
-    results: List[BlobResult] = []
-
-    scale = mm_per_pixel(frame)
-    if scale is None:
-        cv2.putText(
-            output,
-            "ArUco marker ID 0 not found",
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            2,
-        )
-        return output, results
-
-    mask = find_plate_mask(frame)
-    blobs = segment_food(frame, mask)
-    for cnt in blobs:
-        area_px = cv2.contourArea(cnt)
-        area_mm2 = area_px * (scale ** 2)
-        volume_ml = (area_mm2 * ASSUMED_HEIGHT_MM) / 1000.0
-        x, y, w, h = cv2.boundingRect(cnt)
-        crop = frame[y : y + h, x : x + w]
-        label = classify_blob(crop)
-        results.append(BlobResult(label=label, volume_ml=volume_ml, bbox=(x, y, w, h)))
-        cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(
-            output,
-            f"{label}: {volume_ml:.1f} mL",
-            (x, y - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            2,
-        )
-
-    return output, results
-
-
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover - relies on camera hardware
     cam = create_camera()
+    bg_sub = cv2.createBackgroundSubtractorMOG2(
+        history=500, varThreshold=50, detectShadows=False
+    )
     prev: Optional[np.ndarray] = None
     stable_count = 0
     armed = False
@@ -248,6 +123,8 @@ def main() -> None:
                     break
                 frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
+            fg_mask = bg_sub.apply(frame)
+
             if prev is None:
                 prev = frame
                 continue
@@ -255,9 +132,12 @@ def main() -> None:
             mp = motion_percent(prev, frame)
             prev = frame
 
+            fg_area = np.count_nonzero(fg_mask)
+
             if time.time() > overlay_until:
                 overlay = None
-            if not armed and mp > MOTION_ENTER_THR:
+
+            if not armed and fg_area > FG_AREA_ENTER:
                 armed = True
                 stable_count = 0
 
@@ -268,11 +148,41 @@ def main() -> None:
                     stable_count = 0
 
                 if stable_count >= STABLE_FRAMES:
-                    annotated, infos = analyse_plate(frame)
-                    for i, info in enumerate(infos, 1):
-                        print(f"Blob {i}: {info.label} ~ {info.volume_ml:.1f} mL")
-                    overlay = annotated
-                    overlay_until = time.time() + 3.0
+                    contours, _ = cv2.findContours(
+                        fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    if contours:
+                        c = max(contours, key=cv2.contourArea)
+                        x, y, w, h = cv2.boundingRect(c)
+                        scale = mm_per_pixel(frame)
+                        output = frame.copy()
+                        if scale is not None:
+                            width_mm = w * scale
+                            height_mm = h * scale
+                            cv2.rectangle(
+                                output, (x, y), (x + w, y + h), (0, 255, 0), 2
+                            )
+                            cv2.putText(
+                                output,
+                                f"{width_mm:.1f} x {height_mm:.1f} mm",
+                                (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (0, 255, 0),
+                                2,
+                            )
+                        else:
+                            cv2.putText(
+                                output,
+                                "Marker ID 0 not found",
+                                (20, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1.0,
+                                (0, 0, 255),
+                                2,
+                            )
+                        overlay = output
+                        overlay_until = time.time() + 3.0
                     armed = False
                     stable_count = 0
 
