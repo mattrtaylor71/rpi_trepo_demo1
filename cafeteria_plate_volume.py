@@ -1,25 +1,30 @@
 
-"""Detect a stationary plate and capture its image.
+"""Cafeteria plate analysis with motion based capture.
 
-This script streams frames from a Raspberry Pi camera and waits for a plate to
-be placed beneath the camera. Once a circular plate is detected and remains
-stationary for a short period, a still image is captured and written to disk.
+This script streams frames from a Raspberry Pi camera (Picamera2 when
+available, otherwise OpenCV) and watches for a new object entering the
+scene. Once the view stabilises for a short period the script captures a
+high‑resolution still image, segments the plate contents and estimates the
+volume of each detected food blob. Each blob is then classified using an
+OpenAI vision model to provide a short food label.
 
-The implementation is intentionally lightweight and reuses the Picamera2 setup
-found in ``gesture_with_capture.py``. It only performs the detection and capture
-step; further analysis of the plate contents can be added later.
+The table is expected to include a DICT_4X4_50 ArUco marker with ID 0 to
+derive a millimetres‑per‑pixel scale for volume estimates.
 """
 
 from __future__ import annotations
 
+import base64
+import os
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+
 
 import cv2
 import numpy as np
 
-try:  # pragma: no cover - Picamera2 is only available on Raspberry Pi
+try:  # pragma: no cover - Picamera2 only available on Raspberry Pi
     from picamera2 import Picamera2
 except Exception:  # pragma: no cover
     Picamera2 = None  # type: ignore
@@ -31,7 +36,10 @@ except Exception:  # pragma: no cover
 FRAME_W, FRAME_H = 640, 480
 STILL_W, STILL_H = 2304, 1296
 STABLE_FRAMES = 15
-MOVEMENT_THR = 5  # px tolerance for plate stability
+MOTION_ENTER_THR = 15.0  # percentage of pixels that must change to trigger
+MOTION_STABLE_THR = 2.0   # percentage of pixels allowed to change when stable
+ARUCO_MARKER_MM = 40      # physical size of the ID 0 marker
+ASSUMED_HEIGHT_MM = 10    # assumed height of food for volume estimation
 
 
 # ---------------------------------------------------------------------------
@@ -69,35 +77,139 @@ def create_camera() -> Camera:
 
 
 # ---------------------------------------------------------------------------
-# Plate detection
+# Motion detection
 # ---------------------------------------------------------------------------
 
 
-def find_plate(frame: np.ndarray) -> Optional[Tuple[int, int, int]]:
-    """Return (x, y, r) for the largest detected circle (plate)."""
+def motion_percent(prev: np.ndarray, curr: np.ndarray) -> float:
+    """Return percentage of pixels that changed between the two frames."""
+
+    gray_prev = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
+    gray_curr = cv2.cvtColor(curr, cv2.COLOR_RGB2GRAY)
+    diff = cv2.absdiff(gray_prev, gray_curr)
+    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+    changed = np.count_nonzero(thresh)
+    return changed * 100.0 / thresh.size
+
+
+# ---------------------------------------------------------------------------
+# Plate / food processing
+# ---------------------------------------------------------------------------
+
+
+ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+
+
+def mm_per_pixel(frame: np.ndarray) -> Optional[float]:
+    """Return millimetres per pixel using the ID 0 ArUco marker."""
 
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (7, 7), 0)
-    circles = cv2.HoughCircles(
-        gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=100, param1=100, param2=30
-    )
-    if circles is None:
+    corners, ids, _ = cv2.aruco.detectMarkers(gray, ARUCO_DICT)
+    if ids is None:
         return None
-    circles = np.round(circles[0, :]).astype(int)
-    x, y, r = max(circles, key=lambda c: c[2])
-    return x, y, r
+    for c, i in zip(corners, ids.flatten()):
+        if i == 0:
+            side_px = np.mean(
+                [
+                    np.linalg.norm(c[0][0] - c[0][1]),
+                    np.linalg.norm(c[0][1] - c[0][2]),
+                    np.linalg.norm(c[0][2] - c[0][3]),
+                    np.linalg.norm(c[0][3] - c[0][0]),
+                ]
+            )
+            return ARUCO_MARKER_MM / side_px
+    return None
+
+
+def find_plate_mask(frame: np.ndarray) -> np.ndarray:
+    """Approximate the plate as the largest contour."""
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros_like(gray)
+    plate = max(contours, key=cv2.contourArea)
+    mask = np.zeros_like(gray)
+    cv2.drawContours(mask, [plate], -1, 255, -1)
+    return mask
+
+
+def segment_food(frame: np.ndarray, plate_mask: np.ndarray) -> List[np.ndarray]:
+    """Return contours for food blobs inside the plate."""
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    food = np.where(((s > 30) | (v < 200)) & (plate_mask > 0), 255, 0).astype(np.uint8)
+    food = cv2.morphologyEx(food, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(food, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return [c for c in contours if cv2.contourArea(c) > 500]
+
+
+def classify_blob(img: np.ndarray) -> str:
+    """Classify a blob image using an OpenAI vision model."""
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return "unknown"
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        ok, buf = cv2.imencode(".png", img)
+        if not ok:
+            return "unknown"
+        b64 = base64.b64encode(buf).decode("utf-8")
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Identify the food in this image."},
+                        {"type": "image", "image_base64": b64},
+                    ],
+                }
+            ],
+        )
+        return resp.output[0].content[0].text.strip()
+    except Exception:
+        return "unknown"
+
+
+def analyse_plate(frame: np.ndarray) -> None:
+    """Analyse the plate for food blobs and print volumes."""
+
+    scale = mm_per_pixel(frame)
+    if scale is None:
+        print("ArUco marker ID 0 not found; cannot compute volume")
+        return
+
+    mask = find_plate_mask(frame)
+    blobs = segment_food(frame, mask)
+    for i, cnt in enumerate(blobs, 1):
+        area_px = cv2.contourArea(cnt)
+        area_mm2 = area_px * (scale ** 2)
+        volume_ml = (area_mm2 * ASSUMED_HEIGHT_MM) / 1000.0
+        x, y, w, h = cv2.boundingRect(cnt)
+        crop = frame[y : y + h, x : x + w]
+        label = classify_blob(crop)
+        print(f"Blob {i}: {label} ~ {volume_ml:.1f} mL")
 
 
 # ---------------------------------------------------------------------------
-# Main logic
+# Main loop
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
     cam = create_camera()
-
-    prev_circle: Optional[Tuple[int, int, int]] = None
-    stable = 0
+    prev: Optional[np.ndarray] = None
+    stable_count = 0
+    armed = False
 
     try:
         while True:
@@ -109,22 +221,24 @@ def main() -> None:
                     break
                 frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-            circle = find_plate(frame)
+            if prev is None:
+                prev = frame
+                continue
 
-            if circle is not None:
-                x, y, r = circle
-                cv2.circle(frame, (x, y), r, (0, 255, 0), 2)
-                if prev_circle is not None:
-                    dx = abs(x - prev_circle[0])
-                    dy = abs(y - prev_circle[1])
-                    dr = abs(r - prev_circle[2])
-                    if dx < MOVEMENT_THR and dy < MOVEMENT_THR and dr < MOVEMENT_THR:
-                        stable += 1
-                    else:
-                        stable = 0
-                prev_circle = (x, y, r)
+            mp = motion_percent(prev, frame)
+            prev = frame
 
-                if stable >= STABLE_FRAMES:
+            if not armed and mp > MOTION_ENTER_THR:
+                armed = True
+                stable_count = 0
+
+            if armed:
+                if mp < MOTION_STABLE_THR:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+
+                if stable_count >= STABLE_FRAMES:
                     ts = time.strftime("%Y%m%d_%H%M%S")
                     filename = f"plate_{ts}.jpg"
                     if cam.picam2 is not None:
@@ -134,17 +248,17 @@ def main() -> None:
                         cam.picam2.switch_mode(cam.video_cfg)
                         cv2.imwrite(filename, cv2.cvtColor(still, cv2.COLOR_RGB2BGR))
                     else:
-                        cv2.imwrite(filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                        still = frame
+                        cv2.imwrite(filename, cv2.cvtColor(still, cv2.COLOR_RGB2BGR))
                     print(f"Saved {filename}")
-                    stable = 0
-                    prev_circle = None
-            else:
-                stable = 0
-                prev_circle = None
+                    analyse_plate(still)
+                    armed = False
+                    stable_count = 0
 
-            cv2.imshow("plate", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            if cv2.waitKey(1) == 27:  # ESC to quit
+            cv2.imshow("cafeteria", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            if cv2.waitKey(1) == 27:
                 break
+
     finally:
         if cam.picam2 is not None:
             cam.picam2.stop()
