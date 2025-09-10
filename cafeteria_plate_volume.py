@@ -61,8 +61,14 @@ def create_capture() -> cv2.VideoCapture:
     avoid the "failed to allocate required memory" GStreamer error commonly
     seen on resource constrained devices.
     """
-    cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
+    cap = cv2.VideoCapture()
+    try:
+        cap.open(GST_PIPELINE, cv2.CAP_GSTREAMER)
+    except KeyboardInterrupt:
+        cap.release()
+        raise
     if not cap.isOpened():
+        cap.release()
         cap = cv2.VideoCapture(CAMERA_INDEX)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -170,63 +176,69 @@ def classify_food(img: np.ndarray) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    cap = create_capture()
-    if not cap.isOpened():
-        raise RuntimeError("Unable to open camera")
-    prev = None
-    stable_count = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.1)
-            continue
-
-        scale = detect_marker(frame)
-        if scale is None:
-            cv2.imshow("camera", frame)
-            if cv2.waitKey(1) == 27:
-                break
-            continue
-
-        if prev is not None:
-            diff = cv2.absdiff(frame, prev)
-            mean_diff = diff.mean()
-            if mean_diff < STABLE_THRESH:
-                stable_count += 1
-            else:
-                stable_count = 0
-        prev = frame.copy()
-
-        if stable_count < STABLE_FRAMES:
-            cv2.imshow("camera", frame)
-            if cv2.waitKey(1) == 27:
-                break
-            continue
-
-        # plate stable - process once
-        plate = detect_plate(frame)
-        if plate is None:
-            stable_count = 0
-            continue
-        mask, (x, y, r) = plate
-        plate_img = cv2.bitwise_and(frame, frame, mask=mask)
-        blobs = segment_foods(plate_img, scale)
-
-        print("Detected foods:")
-        for blob in blobs:
-            print(f"  {blob.label}: {blob.volume_ml:.1f} ml")
-
-        # reset for next plate
+    cap: Optional[cv2.VideoCapture] = None
+    try:
+        cap = create_capture()
+        if not cap.isOpened():
+            raise RuntimeError("Unable to open camera")
+        prev = None
         stable_count = 0
-        time.sleep(2)
 
-        cv2.imshow("camera", frame)
-        if cv2.waitKey(1) == 27:
-            break
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
 
-    cap.release()
-    cv2.destroyAllWindows()
+            scale = detect_marker(frame)
+            if scale is None:
+                cv2.imshow("camera", frame)
+                if cv2.waitKey(1) == 27:
+                    break
+                continue
+
+            if prev is not None:
+                diff = cv2.absdiff(frame, prev)
+                mean_diff = diff.mean()
+                if mean_diff < STABLE_THRESH:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+            prev = frame.copy()
+
+            if stable_count < STABLE_FRAMES:
+                cv2.imshow("camera", frame)
+                if cv2.waitKey(1) == 27:
+                    break
+                continue
+
+            # plate stable - process once
+            plate = detect_plate(frame)
+            if plate is None:
+                stable_count = 0
+                continue
+            mask, (x, y, r) = plate
+            plate_img = cv2.bitwise_and(frame, frame, mask=mask)
+            blobs = segment_foods(plate_img, scale)
+
+            print("Detected foods:")
+            for blob in blobs:
+                print(f"  {blob.label}: {blob.volume_ml:.1f} ml")
+
+            # reset for next plate
+            stable_count = 0
+            time.sleep(2)
+
+            cv2.imshow("camera", frame)
+            if cv2.waitKey(1) == 27:
+                break
+
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+    finally:
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
