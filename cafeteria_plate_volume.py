@@ -1,3 +1,4 @@
+
 """Detect a stationary plate and capture its image.
 
 This script streams frames from a Raspberry Pi camera and waits for a plate to
@@ -154,4 +155,3 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
