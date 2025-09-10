@@ -129,12 +129,17 @@ def find_plate_mask(frame: np.ndarray) -> np.ndarray:
 
 
 def segment_food(frame: np.ndarray, plate_mask: np.ndarray) -> List[np.ndarray]:
-    """Return contours for food blobs inside the plate."""
+    """Return contours for food blobs inside the plate using background subtraction."""
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
-    food = np.where(((s > 30) | (v < 200)) & (plate_mask > 0), 255, 0).astype(np.uint8)
+    # Extract the plate region and model a smooth background of the plate using
+    # a large median blur.  Differences from this background correspond to food
+    # items and other irregularities on the plate surface.
+    plate = cv2.bitwise_and(frame, frame, mask=plate_mask)
+    background = cv2.medianBlur(plate, 21)
+    diff = cv2.absdiff(plate, background)
+
+    gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
+    _, food = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
     food = cv2.morphologyEx(food, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     contours, _ = cv2.findContours(food, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return [c for c in contours if cv2.contourArea(c) > 500]
@@ -177,7 +182,6 @@ def classify_blob(img: np.ndarray) -> str:
         return resp.output[0].content[0].text.strip()
     except Exception:
         return "unknown"
-
 def analyse_plate(frame: np.ndarray) -> Tuple[np.ndarray, List[BlobResult]]:
     """Analyse the plate and return an annotated frame and blob info."""
 
