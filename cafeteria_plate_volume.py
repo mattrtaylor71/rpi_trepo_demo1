@@ -1,3 +1,4 @@
+
 """Cafeteria plate analysis with motion based capture.
 
 This script streams frames from a Raspberry Pi camera (Picamera2 when
@@ -18,6 +19,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
 
 import cv2
 import numpy as np
@@ -267,4 +269,3 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
