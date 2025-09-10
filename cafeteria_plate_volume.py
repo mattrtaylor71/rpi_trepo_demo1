@@ -26,7 +26,14 @@ except Exception:  # pragma: no cover - OpenAI might not be installed
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+# Video capture settings. On embedded devices using the default OpenCV
+# backend can exhaust memory. We try a low-resolution GStreamer pipeline first
+# and fall back to the standard camera index with an explicit resolution.
 CAMERA_INDEX = 0
+GST_PIPELINE = (
+    "nvarguscamerasrc ! video/x-raw(memory:NVMM),width=640,height=480,framerate=30/1 ! "
+    "nvvidconv ! video/x-raw, format=BGRx ! videoconvert ! appsink"
+)
 MARKER_DICT = cv2.aruco.DICT_4X4_50
 MARKER_ID = 0
 MARKER_SIZE_MM = 50  # physical side length of the marker
@@ -44,6 +51,22 @@ class FoodBlob:
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
+
+
+def create_capture() -> cv2.VideoCapture:
+    """Create a video capture object with memory-friendly settings.
+
+    Tries a low-resolution GStreamer pipeline first. If that fails, falls back
+    to the default camera index and explicitly sets a smaller resolution to
+    avoid the "failed to allocate required memory" GStreamer error commonly
+    seen on resource constrained devices.
+    """
+    cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    return cap
 
 def detect_marker(frame: np.ndarray) -> Optional[float]:
     """Return pixel-to-mm scale using a known ArUco marker.
@@ -147,7 +170,9 @@ def classify_food(img: np.ndarray) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = create_capture()
+    if not cap.isOpened():
+        raise RuntimeError("Unable to open camera")
     prev = None
     stable_count = 0
 
