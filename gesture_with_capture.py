@@ -653,10 +653,13 @@ SMOOTH_COLS, SMOOTH_ROWS = 5, 5
 POOL_FRAMES = 3
 HEADLESS = os.environ.get("DISPLAY", "") == ""
 
-# Mediapipe thumbs-up detection cadence
-THUMBS_UP_FRAME_SKIP = 2   # run classifier every N frames
+# Mediapipe thumbs-up detection cadence / heuristics
+THUMBS_UP_FRAME_SKIP = 1   # run classifier every N frames (1=every frame)
 THUMBS_UP_COOLDOWN_S  = 1.5
-THUMBS_UP_MIN_MARGIN  = 0.02
+THUMBS_UP_MIN_MARGIN  = 0.015
+THUMBS_UP_MIN_VERTICAL_COS = 0.45
+THUMBS_UP_MIN_EXTENSION   = 0.35
+THUMBS_UP_OTHER_FOLD_MIN  = 3
 
 CAPTURE_COOLDOWN_S = 2.5
 last_capture_t = 0.0
@@ -727,34 +730,59 @@ def center_laplacian(bgr):
     crop = cv2.cvtColor(bgr[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
     return laplacian_sharpness(crop)
 
-def _finger_curled(lm, tip_idx, pip_idx):
-    return lm[tip_idx].y > (lm[pip_idx].y - THUMBS_UP_MIN_MARGIN)
+def _finger_fold_score(lm, tip_idx, pip_idx, mcp_idx):
+    tip = lm[tip_idx]
+    pip = lm[pip_idx]
+    mcp = lm[mcp_idx]
+    return (
+        tip.y > (pip.y - THUMBS_UP_MIN_MARGIN)
+        and tip.y > (mcp.y - THUMBS_UP_MIN_MARGIN * 0.5)
+    )
+
 
 def is_thumb_up(hand_landmarks) -> bool:
     if hand_landmarks is None:
         return False
+
     lm = hand_landmarks.landmark
-    thumb_tip = lm[4]
-    thumb_ip  = lm[3]
+    wrist = lm[0]
     thumb_mcp = lm[2]
-    wrist     = lm[0]
+    thumb_ip = lm[3]
+    thumb_tip = lm[4]
 
-    thumb_high = (
-        thumb_tip.y < wrist.y - THUMBS_UP_MIN_MARGIN and
-        thumb_tip.y < thumb_ip.y - THUMBS_UP_MIN_MARGIN and
-        thumb_tip.y < thumb_mcp.y - THUMBS_UP_MIN_MARGIN
-    )
+    # Require the thumb tip to be well above the wrist and interphalangeal joint
+    if (wrist.y - thumb_tip.y) < THUMBS_UP_MIN_MARGIN:
+        return False
+    if (thumb_ip.y - thumb_tip.y) < (THUMBS_UP_MIN_MARGIN * 0.5):
+        return False
 
+    # Check that the thumb points mostly upward (roughly aligned with the Y axis)
+    thumb_vec = np.array([thumb_tip.x - thumb_mcp.x, thumb_tip.y - thumb_mcp.y], dtype=np.float32)
+    thumb_len = float(np.linalg.norm(thumb_vec))
+    if thumb_len < 1e-6:
+        return False
+    thumb_verticality = -thumb_vec[1] / thumb_len
+    if thumb_verticality < THUMBS_UP_MIN_VERTICAL_COS:
+        return False
+
+    # Ensure the thumb is extended relative to the palm size
     palm_ref = np.hypot(lm[9].x - wrist.x, lm[9].y - wrist.y) + 1e-6
-    thumb_span = np.hypot(thumb_tip.x - wrist.x, thumb_tip.y - wrist.y)
-    thumb_extended = thumb_span > 0.55 * palm_ref
+    if thumb_len < THUMBS_UP_MIN_EXTENSION * palm_ref:
+        return False
 
-    other_folded = all(
-        _finger_curled(lm, tip, pip)
-        for tip, pip in ((8,6), (12,10), (16,14), (20,18))
+    # Most other fingers should be folded / below the thumb tip
+    folded = sum(
+        _finger_fold_score(lm, tip, pip, mcp)
+        for tip, pip, mcp in ((8, 6, 5), (12, 10, 9), (16, 14, 13), (20, 18, 17))
     )
+    if folded < THUMBS_UP_OTHER_FOLD_MIN:
+        return False
 
-    return thumb_high and thumb_extended and other_folded
+    # Avoid confusing an open palm for thumbs-up by ensuring index tip is not higher than the thumb
+    if lm[8].y < thumb_tip.y - THUMBS_UP_MIN_MARGIN:
+        return False
+
+    return True
 
 # Camera
 picam2 = Picamera2()
@@ -785,9 +813,12 @@ if _HAS_MEDIAPIPE:
     hands_detector = _MP_HANDS.Hands(
         model_complexity=0,
         max_num_hands=1,
-        min_detection_confidence=0.6,
+        min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
+    print("[thumbs] Mediapipe hands detector initialised")
+else:
+    print("[thumbs] Mediapipe not available – thumbs-up capture disabled")
 
 def capture_high_quality(tag: str):
     with cam_lock:
@@ -1087,8 +1118,9 @@ try:
                 print(f"[thumbs] detector error: {exc}")
             finally:
                 rgb.flags.writeable = True
-            if mp_result and mp_result.multi_hand_landmarks:
-                for hand_landmarks in mp_result.multi_hand_landmarks:
+            hand_landmarks_seq = getattr(mp_result, "multi_hand_landmarks", None)
+            if hand_landmarks_seq:
+                for hand_landmarks in hand_landmarks_seq:
                     if is_thumb_up(hand_landmarks):
                         gesture_text = "THUMBS_UP"
                         last_thumb_gesture = now
