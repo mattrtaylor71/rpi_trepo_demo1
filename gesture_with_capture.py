@@ -1,4 +1,4 @@
-import time, os, collections, threading, queue, base64, datetime, csv, re
+import time, os, collections, threading, queue, base64, datetime, csv, re, platform
 import numpy as np
 import cv2
 from picamera2 import Picamera2
@@ -818,7 +818,13 @@ if _HAS_MEDIAPIPE:
     )
     print("[thumbs] Mediapipe hands detector initialised")
 else:
+    arch = platform.machine().lower()
+    if arch.startswith("x86") or arch.startswith("amd64"):
+        mp_pkg = "mediapipe"
+    else:
+        mp_pkg = "mediapipe-rpi4"
     print("[thumbs] Mediapipe not available – thumbs-up capture disabled")
+    print(f"[thumbs] Install it with 'pip install {mp_pkg}' (or run ./install_deps_for_capture.sh)")
 
 def capture_high_quality(tag: str):
     with cam_lock:
