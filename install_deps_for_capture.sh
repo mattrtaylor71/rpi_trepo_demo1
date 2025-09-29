@@ -35,12 +35,20 @@ echo "==> Installing Python packages in venv"
 # - absl-py fixes your 'No module named absl' error
 # - openai is the official SDK (v1+)
 # - python-dotenv optional: loads .env locally if you want
+ARCH=$(uname -m)
+MP_PKG="mediapipe==0.10.9"
+if [[ "${ARCH}" == "aarch64" || "${ARCH}" == "armv7l" ]]; then
+  MP_PKG="mediapipe-rpi4==0.10.9"
+fi
+echo "==> Using Mediapipe package: ${MP_PKG}"
+
 "${VENV}/bin/pip" install \
   "numpy==1.26.4" \
   "${OPENCV_PKG}==4.8.1.78" \
   "absl-py>=1.4.0" \
   "openai>=1.40.0" \
-  "python-dotenv>=1.0.1"
+  "python-dotenv>=1.0.1" \
+  "${MP_PKG}"
 
 echo "==> Done."
 

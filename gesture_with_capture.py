@@ -1,7 +1,22 @@
-import time, os, collections, threading, queue, base64, datetime, csv, re
+import time, os, collections, threading, queue, base64, datetime, csv, re, platform
 import numpy as np
 import cv2
 from picamera2 import Picamera2
+
+# Keep ML frameworks quieter before importing Mediapipe
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+try:
+    import mediapipe as mp
+    _MP_HANDS = mp.solutions.hands
+    _MP_DRAWING = mp.solutions.drawing_utils
+    _HAS_MEDIAPIPE = True
+except Exception:  # pragma: no cover - optional dependency
+    mp = None
+    _MP_HANDS = None
+    _MP_DRAWING = None
+    _HAS_MEDIAPIPE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EPAPER UI (2.13" mono B/W V4) — PARTIAL-ONLY AFTER BOOT (no flashing)
@@ -638,6 +653,14 @@ SMOOTH_COLS, SMOOTH_ROWS = 5, 5
 POOL_FRAMES = 3
 HEADLESS = os.environ.get("DISPLAY", "") == ""
 
+# Mediapipe thumbs-up detection cadence / heuristics
+THUMBS_UP_FRAME_SKIP = 1   # run classifier every N frames (1=every frame)
+THUMBS_UP_COOLDOWN_S  = 1.5
+THUMBS_UP_MIN_MARGIN  = 0.015
+THUMBS_UP_MIN_VERTICAL_COS = 0.45
+THUMBS_UP_MIN_EXTENSION   = 0.35
+THUMBS_UP_OTHER_FOLD_MIN  = 3
+
 CAPTURE_COOLDOWN_S = 2.5
 last_capture_t = 0.0
 countdown_last_sec = -1
@@ -707,6 +730,60 @@ def center_laplacian(bgr):
     crop = cv2.cvtColor(bgr[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
     return laplacian_sharpness(crop)
 
+def _finger_fold_score(lm, tip_idx, pip_idx, mcp_idx):
+    tip = lm[tip_idx]
+    pip = lm[pip_idx]
+    mcp = lm[mcp_idx]
+    return (
+        tip.y > (pip.y - THUMBS_UP_MIN_MARGIN)
+        and tip.y > (mcp.y - THUMBS_UP_MIN_MARGIN * 0.5)
+    )
+
+
+def is_thumb_up(hand_landmarks) -> bool:
+    if hand_landmarks is None:
+        return False
+
+    lm = hand_landmarks.landmark
+    wrist = lm[0]
+    thumb_mcp = lm[2]
+    thumb_ip = lm[3]
+    thumb_tip = lm[4]
+
+    # Require the thumb tip to be well above the wrist and interphalangeal joint
+    if (wrist.y - thumb_tip.y) < THUMBS_UP_MIN_MARGIN:
+        return False
+    if (thumb_ip.y - thumb_tip.y) < (THUMBS_UP_MIN_MARGIN * 0.5):
+        return False
+
+    # Check that the thumb points mostly upward (roughly aligned with the Y axis)
+    thumb_vec = np.array([thumb_tip.x - thumb_mcp.x, thumb_tip.y - thumb_mcp.y], dtype=np.float32)
+    thumb_len = float(np.linalg.norm(thumb_vec))
+    if thumb_len < 1e-6:
+        return False
+    thumb_verticality = -thumb_vec[1] / thumb_len
+    if thumb_verticality < THUMBS_UP_MIN_VERTICAL_COS:
+        return False
+
+    # Ensure the thumb is extended relative to the palm size
+    palm_ref = np.hypot(lm[9].x - wrist.x, lm[9].y - wrist.y) + 1e-6
+    if thumb_len < THUMBS_UP_MIN_EXTENSION * palm_ref:
+        return False
+
+    # Most other fingers should be folded / below the thumb tip
+    folded = sum(
+        _finger_fold_score(lm, tip, pip, mcp)
+        for tip, pip, mcp in ((8, 6, 5), (12, 10, 9), (16, 14, 13), (20, 18, 17))
+    )
+    if folded < THUMBS_UP_OTHER_FOLD_MIN:
+        return False
+
+    # Avoid confusing an open palm for thumbs-up by ensuring index tip is not higher than the thumb
+    if lm[8].y < thumb_tip.y - THUMBS_UP_MIN_MARGIN:
+        return False
+
+    return True
+
 # Camera
 picam2 = Picamera2()
 video_cfg = picam2.create_video_configuration(
@@ -730,6 +807,24 @@ except Exception:
     pass
 picam2.start()
 cam_lock = threading.Lock()
+
+hands_detector = None
+if _HAS_MEDIAPIPE:
+    hands_detector = _MP_HANDS.Hands(
+        model_complexity=0,
+        max_num_hands=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    print("[thumbs] Mediapipe hands detector initialised")
+else:
+    arch = platform.machine().lower()
+    if arch.startswith("x86") or arch.startswith("amd64"):
+        mp_pkg = "mediapipe"
+    else:
+        mp_pkg = "mediapipe-rpi4"
+    print("[thumbs] Mediapipe not available – thumbs-up capture disabled")
+    print(f"[thumbs] Install it with 'pip install {mp_pkg}' (or run ./install_deps_for_capture.sh)")
 
 def capture_high_quality(tag: str):
     with cam_lock:
@@ -790,6 +885,7 @@ MODE_MAP = {
     "SWIPE_RIGHT": "check_in",
     "SWIPE_LEFT":  "discard",
     "SWIPE_DOWN":  "opened",
+    "THUMBS_UP":   "check_in",
 }
 current_mode = None
 armed = False
@@ -797,6 +893,8 @@ arm_time = 0.0
 stable_count = 0
 awaiting_expiry = False
 expiry_prompt_time = 0.0
+last_thumb_gesture = 0.0
+thumb_frame_counter = 0
 
 # Inventory browsing state
 INVENTORY_TIMEOUT_S = 30.0
@@ -1006,6 +1104,42 @@ try:
                 set_mode_from(gesture, now_ts, bgr_for_baseline=bgr, motion_for_baseline=ema)
                 EPD_UI.show_mode_prompt(current_mode, 1.0)
                 cv2.putText(dbg, "ARMED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+        check_thumb = False
+        if hands_detector is not None:
+            thumb_frame_counter += 1
+            if thumb_frame_counter >= THUMBS_UP_FRAME_SKIP:
+                thumb_frame_counter = 0
+                check_thumb = True
+
+        if (
+            check_thumb and gesture_text == "" and not inventory_mode and
+            (now - last_thumb_gesture) >= THUMBS_UP_COOLDOWN_S
+        ):
+            mp_result = None
+            rgb.flags.writeable = False
+            try:
+                mp_result = hands_detector.process(rgb)
+            except Exception as exc:
+                print(f"[thumbs] detector error: {exc}")
+            finally:
+                rgb.flags.writeable = True
+            hand_landmarks_seq = getattr(mp_result, "multi_hand_landmarks", None)
+            if hand_landmarks_seq:
+                for hand_landmarks in hand_landmarks_seq:
+                    if is_thumb_up(hand_landmarks):
+                        gesture_text = "THUMBS_UP"
+                        last_thumb_gesture = now
+                        last_fire = now
+                        print("THUMBS_UP")
+                        handle_gesture("THUMBS_UP")
+                        if _MP_DRAWING is not None and _MP_HANDS is not None:
+                            _MP_DRAWING.draw_landmarks(
+                                dbg,
+                                hand_landmarks,
+                                _MP_HANDS.HAND_CONNECTIONS,
+                            )
+                        break
 
         if x_norm is not None:
             if state_x == "IDLE":
@@ -1230,6 +1364,11 @@ try:
             time.sleep(0.002)
 
 finally:
+    if hands_detector is not None:
+        try:
+            hands_detector.close()
+        except Exception:
+            pass
     try:
         picam2.stop()
     except Exception:
